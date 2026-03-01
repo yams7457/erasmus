@@ -15,7 +15,10 @@
 --   Row 1, col 14:     Isolator: Kill lows (<250 Hz) (toggle)
 --   Row 1, col 15:     Isolator: Kill mids (250-3.5k Hz) (toggle)
 --   Row 1, col 16:     Isolator: Kill highs (>3.5k Hz) (toggle)
---   Rows 2-8, cols 1-16: Sample pads / snapshot slots
+--   Row 2, cols 1-16:  Waveform amplitude display (press to jump playhead)
+--   Row 3, cols 1-10:  Pitch shift (-12,-10,-7,-5,-2,+2,+5,+7,+10,+12 semitones)
+--   Row 3, col 16:     Record arm (idle→armed→recording→idle with loop)
+--   Rows 4-8, cols 1-16: Sample pads / snapshot slots
 --
 -- Norns controls:
 --   E1: Tempo
@@ -105,6 +108,29 @@ local snapshot_flash_pos = nil  -- {col=, row=} of last snapshot action
 -- Isolator state (toggle kills, row 1 cols 14-16)
 local iso_kills = {false, false, false}  -- [1]=low (col14), [2]=mid (col15), [3]=high (col16)
 
+-- Pitch shift state (row 3, cols 1-10)
+local pitch_values = {-12, -10, -7, -5, -2, 2, 5, 7, 10, 12}
+local active_pitch_shift = 0
+-- Idle brightness by magnitude: ±2→4, ±5→7, ±7→9, ±10→11, ±12→13
+local pitch_idle_brightness = {13, 11, 9, 7, 4, 4, 7, 9, 11, 13}
+
+-- Waveform display state (row 2)
+local waveform_brightness = {}
+local last_render_time = 0
+local RENDER_INTERVAL = 0.25
+
+-- Record arm state machine (row 3, col 16)
+local rec_state = "idle"  -- "idle", "armed", "recording"
+
+-- Preserve boost: snap to 100% while finger drumming, restore after one
+-- full uninterrupted loop pass with no triggers.
+local preserve_boosted = false
+local trigger_this_loop = false
+
+local function effective_pre_level()
+  return preserve_boosted and 1.0 or preserve_value
+end
+
 -- ─── Helpers ───
 
 -- Map sample index (1-based) to grid position {col, row}
@@ -115,7 +141,7 @@ end
 
 -- Map grid position to sample index (1-based), or nil if not a sample pad
 local function grid_to_sample(col, row)
-  if row < 2 or row > 8 then return nil end
+  if row < 4 or row > 8 then return nil end
   if col < 1 or col > 16 then return nil end
   if not grid_samples[row] then return nil end
   return grid_samples[row][col]
@@ -289,8 +315,8 @@ local function scan_samples()
     end
   end
 
-  -- Flood-fill layout into grid rows 2-8, cols 1-16
-  local MIN_ROW, MAX_ROW = 2, 8
+  -- Flood-fill layout into grid rows 4-8, cols 1-16
+  local MIN_ROW, MAX_ROW = 4, 8
   local MIN_COL, MAX_COL = 1, 16
 
   -- Occupied tracking table
@@ -514,6 +540,10 @@ end
 -- ─── Sample Triggering ───
 local function trigger_sample(idx)
   if idx < 1 or idx > num_samples then return end
+  if rec_state == "armed" then
+    looper:start_capture()
+    rec_state = "recording"
+  end
   local s = samples[idx]
 
   -- mxsampleson(voice_id, buf_id, rate, amp, pan, attack, decay, sustain, release, lpf, hpf, delaySend, reverbSend, sampleStart)
@@ -586,6 +616,64 @@ local function snap_to_power_of_2()
   looper:end_batch()
 end
 
+-- ─── Record Arm Helpers ───
+
+-- Given a captured duration, find integer beat count B (1-32) where
+-- 60*B/D is in [60,119]. Prefer largest power of 2; fallback to B
+-- closest to 90 BPM; last resort clamp to B=1.
+local function calculate_bpm(duration)
+  local valid = {}
+  for b = 1, 32 do
+    local bpm = 60 * b / duration
+    if bpm >= 60 and bpm <= 119 then
+      table.insert(valid, b)
+    end
+  end
+
+  if #valid == 0 then
+    return 60 / duration, 1
+  end
+
+  -- Prefer largest power of 2
+  local best_pow2 = nil
+  for _, b in ipairs(valid) do
+    if b > 0 and (b & (b - 1)) == 0 then
+      if not best_pow2 or b > best_pow2 then
+        best_pow2 = b
+      end
+    end
+  end
+  if best_pow2 then
+    return 60 * best_pow2 / duration, best_pow2
+  end
+
+  -- No power of 2 fits: pick B giving BPM closest to 90
+  local best_b = valid[1]
+  local best_dist = math.abs(60 * valid[1] / duration - 90)
+  for i = 2, #valid do
+    local dist = math.abs(60 * valid[i] / duration - 90)
+    if dist < best_dist then
+      best_dist = dist
+      best_b = valid[i]
+    end
+  end
+  return 60 * best_b / duration, best_b
+end
+
+local function stop_recording()
+  local duration = looper:stop_capture()
+  local bpm, beats = calculate_bpm(duration)
+  looper:load_state(bpm, beats)
+  params:set("clock_tempo", bpm)
+  set_beat_bits(beats)
+  looper:set_pre_level(effective_pre_level())
+  active_pitch_shift = 0
+  save_snapshot(15, 3)
+  rec_state = "idle"
+  grid_dirty = true
+  is_screen_dirty = true
+end
+
 -- ─── Tap Tempo ───
 local function handle_tap_tempo()
   local now = util.time()
@@ -634,7 +722,7 @@ function grid_key(col, row, z)
         preserve0_held = false
         if saved_preserve_value then
           preserve_value = saved_preserve_value
-          looper:set_pre_level(preserve_value)
+          looper:set_pre_level(effective_pre_level())
           saved_preserve_value = nil
         end
         if not buffer_muted then
@@ -657,15 +745,17 @@ function grid_key(col, row, z)
         buffer_muted = false
         if saved_preserve_for_mute then
           preserve_value = saved_preserve_for_mute
-          looper:set_pre_level(preserve_value)
+          looper:set_pre_level(effective_pre_level())
           saved_preserve_for_mute = nil
         end
         looper:set_buffer_muted(false)
       end
     elseif col == 9 and z == 1 then
-      -- Clear all: buffer + preserve + solo + mute + iso
+      -- Clear all: buffer + preserve + solo + mute + iso + boost
       looper:clear_buffer()
       preserve_value = 0.98
+      preserve_boosted = false
+      trigger_this_loop = false
       looper:set_pre_level(preserve_value)
       solo_mode = false
       looper:set_solo_mode(false)
@@ -701,7 +791,48 @@ function grid_key(col, row, z)
     return
   end
 
-  -- ── Rows 2-8, cols 1-16: Sample pads + snapshots ──
+  -- ── Row 2: Waveform display / jump-to-position ──
+  if row == 2 and z == 1 then
+    if rec_state == "armed" then
+      looper:start_capture()
+      rec_state = "recording"
+    end
+    local fraction = (col - 1) / 16
+    looper:jump_to_position(fraction)
+    -- Boost preserve to 100% while jumping around the buffer
+    trigger_this_loop = true
+    if not preserve_boosted and not preserve0_held and not buffer_muted then
+      preserve_boosted = true
+      looper:set_pre_level(1.0)
+    end
+    grid_dirty = true
+    return
+  end
+
+  -- ── Row 3, cols 1-10: Pitch shift (cumulative) ──
+  if row == 3 and col >= 1 and col <= 10 and z == 1 then
+    active_pitch_shift = active_pitch_shift + pitch_values[col]
+    looper:set_pitch_shift(active_pitch_shift)
+    grid_dirty = true
+    is_screen_dirty = true
+    return
+  end
+
+  -- ── Row 3, col 16: Record arm ──
+  if row == 3 and col == 16 and z == 1 then
+    if rec_state == "idle" then
+      rec_state = "armed"
+    elseif rec_state == "armed" then
+      rec_state = "idle"
+    elseif rec_state == "recording" then
+      stop_recording()
+    end
+    grid_dirty = true
+    is_screen_dirty = true
+    return
+  end
+
+  -- ── Rows 4-8, cols 1-16: Sample pads + snapshots ──
   local idx = grid_to_sample(col, row)
   print(string.format("grid_key: col=%d row=%d z=%d idx=%s", col, row, z, tostring(idx)))
   if idx then
@@ -764,7 +895,44 @@ function grid_redraw()
     g:led(col, 1, iso_kills[col - 13] and LED_MAX or LED_DIM)
   end
 
-  -- Rows 2-8: Sample pads (per-group brightness) + snapshots
+  -- Row 2: Waveform amplitude display + playhead ticker
+  local playhead_col = 0
+  if looper.buffer_dur > 0 then
+    playhead_col = math.floor(looper.playhead_pos / looper.buffer_dur * 16) + 1
+    if playhead_col > 16 then playhead_col = 16 end
+  end
+  for col = 1, 16 do
+    if col == playhead_col then
+      g:led(col, 2, LED_MAX)
+    else
+      g:led(col, 2, waveform_brightness[col] or 0)
+    end
+  end
+
+  -- Row 3: Pitch shift buttons (cols 1-10)
+  for col = 1, 10 do
+    g:led(col, 3, pitch_idle_brightness[col])
+  end
+
+  -- Row 3, col 16: Record arm LED
+  if rec_state == "armed" then
+    -- Blink at ~4Hz
+    local phase = now % 0.25
+    g:led(16, 3, phase < 0.125 and LED_MAX or LED_OFF)
+  elseif rec_state == "recording" then
+    g:led(16, 3, LED_MAX)
+  else
+    g:led(16, 3, LED_DIM)
+  end
+
+  -- Rate-limited waveform render request (~4 Hz)
+  local now_render = util.time()
+  if now_render - last_render_time >= RENDER_INTERVAL then
+    last_render_time = now_render
+    looper:request_waveform()
+  end
+
+  -- Rows 4-8: Sample pads (per-group brightness) + snapshots
   for i = 1, num_samples do
     local col, row = sample_to_grid(i)
     local level
@@ -794,8 +962,11 @@ function grid_redraw()
 
   g:refresh()
 
-  -- If we're in a flash window, schedule another redraw to turn it off
-  if is_beat_flash or is_shuffle2_flash or is_shuffle4_flash
+  -- Keep redrawing while playing (playhead ticker needs continuous updates)
+  if looper:get_playing() == 1 then
+    grid_dirty = true
+  elseif rec_state == "armed"
+    or is_beat_flash or is_shuffle2_flash or is_shuffle4_flash
     or is_snap_pow2_flash or is_clear_flash
     or is_snapshot_flash then
     grid_dirty = true
@@ -816,7 +987,12 @@ function redraw()
   screen.text("ERASUMS")
   local tempo = params:get("clock_tempo")
   screen.move(right_x, y)
-  screen.text_right(math.floor(tempo + 0.5) .. "bpm")
+  if active_pitch_shift ~= 0 then
+    local eff = looper:get_effective_tempo()
+    screen.text_right(math.floor(eff + 0.5) .. "bpm (" .. math.floor(tempo + 0.5) .. ")")
+  else
+    screen.text_right(math.floor(tempo + 0.5) .. "bpm")
+  end
 
   -- Loop info
   y = y + 12
@@ -828,7 +1004,7 @@ function redraw()
   screen.text("loop: " .. nb .. " beats [" .. bits_str .. "]")
   screen.move(right_x, y)
   local dur = looper:get_loop_dur()
-  local rate = looper:get_rate()
+  local rate = looper:get_effective_rate()
   if math.abs(rate - 1.0) > 0.005 then
     local semitones = 12 * math.log(rate) / math.log(2)
     screen.text_right(string.format("%.1fs %+.0fst", dur, semitones))
@@ -895,8 +1071,9 @@ function enc(n, delta)
     -- Tempo
     params:delta("clock_tempo", delta)
   elseif n == 2 then
-    -- Preserve (continuous, 5% steps)
+    -- Preserve (continuous, 5% steps) — manual change cancels boost
     preserve_value = util.clamp(preserve_value + delta * 0.05, 0, 1.0)
+    preserve_boosted = false
     looper:set_pre_level(preserve_value)
     grid_dirty = true
     is_screen_dirty = true
@@ -971,9 +1148,30 @@ function init()
   looper:init()
   looper:set_pre_level(preserve_value)
 
-  -- Beat callback for grid flash
+  -- Waveform render callback: copy brightness data and mark grid dirty
+  looper.on_waveform_callback = function()
+    for i = 1, 16 do
+      waveform_brightness[i] = looper.waveform_brightness[i] or 0
+    end
+    grid_dirty = true
+  end
+
+  -- Initial waveform render request
+  looper:request_waveform()
+
+  -- Beat callback for grid flash + preserve boost release
   looper.on_beat_callback = function(beat)
     beat_flash_time = util.time()
+    -- On loop wrap: release preserve boost if no triggers this pass
+    if beat == 0 and preserve_boosted then
+      if not trigger_this_loop then
+        preserve_boosted = false
+        if not preserve0_held and not buffer_muted then
+          looper:set_pre_level(preserve_value)
+        end
+      end
+      trigger_this_loop = false
+    end
     grid_dirty = true
     is_screen_dirty = true
   end

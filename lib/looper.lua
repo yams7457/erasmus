@@ -39,6 +39,10 @@ function Looper.new()
   self.rate = 1.0
   self.buffer_dur = 0          -- set in init(), tracks actual buffer content length
   self._batch = false          -- true during atomic tempo+beats updates
+  self.pitch_shift_semitones = 0
+  self.waveform_brightness = {} -- 16-element brightness cache
+  self.on_waveform_callback = nil
+  self.capturing = false
 
   -- Audio level state for restore
   self.initial_levels = {}
@@ -128,6 +132,38 @@ function Looper:init()
     end
   end)
   softcut.phase_quant(1, 1/30)
+
+  -- Waveform render callback: bins 128 samples into 16 groups, peak per bin,
+  -- then normalizes brightness relative to the loudest bin.
+  softcut.event_render(function(ch, start, sec_per_sample, samples)
+    if ch ~= 1 then return end
+    local n = #samples
+    local bin_size = math.floor(n / 16)
+    if bin_size < 1 then bin_size = 1 end
+    local peaks = {}
+    local max_peak = 0
+    for bin = 1, 16 do
+      local peak = 0
+      local lo = (bin - 1) * bin_size + 1
+      local hi = (bin == 16) and n or (bin * bin_size)
+      for i = lo, hi do
+        local v = math.abs(samples[i] or 0)
+        if v > peak then peak = v end
+      end
+      peaks[bin] = peak
+      if peak > max_peak then max_peak = peak end
+    end
+    for bin = 1, 16 do
+      if max_peak > 0 then
+        this.waveform_brightness[bin] = math.floor((peaks[bin] / max_peak) * 15 + 0.5)
+      else
+        this.waveform_brightness[bin] = 0
+      end
+    end
+    if this.on_waveform_callback then
+      this.on_waveform_callback()
+    end
+  end)
 
   -- Set initial loop_end
   self.loop_dur = (self.num_beats / self.tempo) * 60
@@ -284,7 +320,9 @@ end
 -- Content-preserving buffer resize.
 -- On shrink: copies the most recently heard content to [0, new_buffer_dur].
 -- On expand: tiles existing content to fill [old_dur, new_buffer_dur].
+-- Blocked during capture to protect the staging area.
 function Looper:_resize_buffer(new_buffer_dur)
+  if self.capturing then return end
   local old_end = self.buffer_dur
 
   if new_buffer_dur < old_end and old_end > 0 then
@@ -340,7 +378,9 @@ end
 
 -- Centralized engine→softcut routing. Cut when either solo mode or iso
 -- is active, so unfiltered engine input doesn't contaminate the buffer.
+-- During capture, always keep routing ON so recording isn't interrupted.
 function Looper:_refresh_eng_cut()
+  if self.capturing then return end
   if self.solo_mode or self.iso_active then
     params:set("cut_input_eng", -math.huge)
     audio.level_eng_cut(0)
@@ -464,10 +504,68 @@ function Looper:beat_shuffle(group_size)
   end
 end
 
-function Looper:_apply_rate()
+function Looper:_apply_rate(slew_time)
+  slew_time = slew_time or 0
+  local multiplier = 2 ^ (self.pitch_shift_semitones / 12)
+  local effective = self.rate * multiplier
   for voice = 1, 2 do
-    softcut.rate(voice, self.rate)
+    softcut.rate_slew_time(voice, slew_time)
+    softcut.rate(voice, effective)
   end
+end
+
+function Looper:set_pitch_shift(semitones)
+  self.pitch_shift_semitones = semitones
+  local slew = 60 / self.tempo  -- quarter-note slew
+  self:_apply_rate(slew)
+end
+
+function Looper:get_effective_rate()
+  return self.rate * 2 ^ (self.pitch_shift_semitones / 12)
+end
+
+function Looper:get_effective_tempo()
+  return self.tempo * 2 ^ (self.pitch_shift_semitones / 12)
+end
+
+function Looper:request_waveform()
+  if self.buffer_dur > 0 then
+    softcut.render_buffer(1, 0, self.buffer_dur, 128)
+  end
+end
+
+function Looper:jump_to_position(fraction)
+  local pos = fraction * self.buffer_dur
+  for voice = 1, 2 do
+    softcut.position(voice, pos)
+  end
+end
+
+-- Begin live capture via norns tape, which records the full DAC output
+-- (engine samples + softcut loop playback = exactly what the performer
+-- hears). The main loop continues playing untouched — row 2 jumps and
+-- the playhead ticker work normally throughout the capture.
+function Looper:start_capture()
+  self.capturing = true
+  self.capture_start_time = util.time()
+  audio.tape_record_open(_path.audio .. "erasmus/capture_tmp.wav")
+  audio.tape_record_start()
+end
+
+-- End live capture: stop tape, read the recorded performance back into
+-- the softcut buffer. Returns captured duration in seconds.
+function Looper:stop_capture()
+  self.capturing = false
+  audio.tape_record_stop()
+
+  local duration = math.min(util.time() - self.capture_start_time, 175)
+  duration = math.max(duration, 0.5)
+
+  -- Load captured performance (full DAC mix) into softcut buffer
+  softcut.buffer_read_stereo(_path.audio .. "erasmus/capture_tmp.wav", 0, 0, duration)
+
+  self:_refresh_eng_cut()
+  return duration
 end
 
 function Looper:begin_batch()
