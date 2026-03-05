@@ -1,162 +1,202 @@
 -- erasmus
 -- sample playback (MxSamples engine)
--- + live looper (softcut)
+-- + 3 independent stereo loopers (softcut, 6 voices)
 --
--- Grid 128 layout:
---   Row 1, cols 1-5:   Beat length binary bits (16,8,4,2,1)
---   Row 1, col 6:      Preserve snap to 0% (momentary hold)
---   Row 1, col 7:      Solo mode (latch toggle)
---   Row 1, col 8:      Buffer mute (latch toggle)
---   Row 1, col 9:      Clear all (momentary: buffer + preserve + solo + mute + iso)
---   Row 1, col 10:     Snap to nearest power-of-2 beats (momentary flash)
---   Row 1, col 11:     Tap tempo (momentary, blinks on beat)
---   Row 1, col 12:     Shuffle by 1/2 beat (momentary flash)
---   Row 1, col 13:     Shuffle by 1/4 beat (momentary flash)
---   Row 1, col 14:     Isolator: Kill lows (<250 Hz) (toggle, records to data buffer)
---   Row 1, col 15:     Isolator: Kill mids (250-3.5k Hz) (toggle, records to data buffer)
---   Row 1, col 16:     Isolator: Kill highs (>3.5k Hz) (toggle, records to data buffer)
---   Row 2, cols 1-16:  Waveform amplitude display (press to jump playhead)
---   Row 3, cols 1-10:  Pitch shift (-12,-10,-7,-5,-2,+2,+5,+7,+10,+12 semitones)
---   Row 3, col 15:     Hot swap arm (idle→armed→staged→commit; cancel with re-press)
---   Row 3, col 16:     Record arm (idle→armed→recording→idle with loop)
---   Rows 4-8, cols 1-16: Sample pads (polyphonic oneshot, retrigger on re-press) / snapshot slots
+-- Grid 256 layout: see lib/grid_ui.lua
 --
 -- Norns controls:
 --   E1: Tempo
---   E2: Preserve (continuous, 5% steps)
+--   E2: Preserve (continuous, 5% steps, applies to selected track; all tracks when global)
 --   E3: Sample amp (boost quiet samples)
---   K2: Play/pause looper
---   K3: Toggle recording on/off
+--   K2: Play/pause all loopers
+--   K3: Record arm state machine (idle->armed->recording->idle)
 
 local Looper = include("lib/looper")
+local GridUI = include("lib/grid_ui")
 
 engine.name = "MxSamples"
 
 -- ─── Constants ───
 local SAMPLE_DIR = _path.audio .. "erasmus/"
 local SNAPSHOT_DIR = _path.audio .. "erasmus/snapshots/"
-local MAX_SAMPLES = 80
-local MAX_NUM_BEATS = 32
+local MAX_SAMPLES = 128
+local MAX_NUM_BEATS = 64
 local SCREEN_FRAMERATE = 15
 local GRID_FRAMERATE = 30
--- Polyphonic: each sample uses its own idx as voice ID.
--- The engine voice-steals per ID, so retriggering the same sample
--- restarts it (no layering), while different samples play simultaneously.
+local ENG_LEVEL = 1 / 1.4
 
--- LED brightness
-local LED_OFF = 0
-local LED_DIM = 3
-local LED_MED = 7
-local LED_BRIGHT = 12
-local LED_MAX = 15
+-- ─── Shared State ───
+-- Single mutable state table shared with lib/grid_ui.lua.
+-- Tables are shared by reference; scalars are read/written via state.xxx.
+local state = {
+  tracks = {},
+  selected_track = 1,   -- 1-4 (4 = global)
+  recording_target = 1, -- 1-3, which track gets engine audio
+  g = nil,              -- grid device, set below
+  grid_dirty = true,
+  is_screen_dirty = true,
 
--- Beat length binary bits (5 bits, MSB first: 16,8,4,2,1)
-local beat_bits = {false, false, true, true, true}  -- default 0b00111 = 7, +1 = 8 beats
-local beat_powers = {16, 8, 4, 2, 1}
+  -- Toolbar / menu
+  active_menu = nil,              -- nil or toolbar col (1, 2, 3, 4, 5) with open menu
+  toolbar_held = nil,             -- toolbar col being physically held
+  length_hold_made_selection = false,
+  shuffle_flash_time = 0,         -- flash timestamp for shuffle button
 
--- ─── State ───
-local looper
-local g = grid.connect()
-local grid_dirty = true
-local is_screen_dirty = true
+  -- Per-track state (indexed 1-3)
+  track_iso_kills = {{false,false,false}, {false,false,false}, {false,false,false}},
+  track_preserve = {0.98, 0.98, 0.98},
+  track_preserve_boosted = {false, false, false},
+  track_trigger_this_loop = {false, false, false},
+  track_preserve0_held = {false, false, false},
+  track_saved_preserve = {nil, nil, nil},
+  track_recording_enabled = {true, true, true},
+  track_output_muted = {false, false, false},    -- track mute: mutes playback output
+  track_reversed = {false, false, false},        -- reverse playback per track
+  track_writing_name = {nil, nil, nil},          -- active sample name being written per track
+
+  -- Reset counter (6 bits -> beat interval; 0 = disabled)
+  reset_bits = {false, false, false, false, false, false},
+  reset_counter_beats = 0,
+  global_beat_count = 0,
+
+  -- Sample management
+  samples = {},
+  num_samples = 0,
+  grid_samples = {},
+  group_names = {},
+  group_brightness = {},
+
+  -- Grid state
+  current_playing_pad = nil,
+
+  -- Per-sample state
+  pad_amps = {},
+
+  -- Clear flash (per-track and global)
+  clear_flash_time = {0, 0, 0},
+  global_clear_flash_time = 0,
+
+  -- Cue points (placed on sample plane, jump to stored position)
+  cue_points = {},         -- list of {track_idx, fraction, grid_row, grid_col}
+  grid_cue_points = {},    -- reverse lookup: grid_cue_points[row][col] = cue index
+
+  -- Scene snapshots (all 3 tracks saved/loaded together)
+  snapshots = {},          -- list of {grid_row, grid_col, base, bpm, beats={b1,b2,b3}}
+  grid_snapshots = {},     -- reverse lookup: grid_snapshots[row][col] = snapshot index
+  snapshot_flash_time = 0,
+
+  -- Record arm state machine (K3)
+  rec_state = "idle",  -- "idle", "armed", "recording"
+
+  -- Tap tempo
+  tap_times = {},       -- list of recent tap timestamps
+  tap_tempo_max = 4,    -- number of taps to average
+}
+
+-- Local state (not shared with grid)
 local screen_refresh_metro
 local grid_refresh_metro
 
--- Sample management
-local samples = {}         -- {filepath, name, slot, grid_row, grid_col} indexed 1..N
-local num_samples = 0
-local grid_samples = {}    -- grid_samples[row][col] = sample index, for grid->sample lookup
-local group_names = {}     -- group_names[group_idx] = folder name for display
-local group_brightness = {} -- group_brightness[group_idx] = LED brightness for idle pads
+-- Connect grid device
+state.g = grid.connect()
 
--- Grid state
-local preserve_value = 0.98        -- continuous 0.0-1.0
-local current_playing_pad = nil    -- which sample pad index is currently active
+-- ─── Shared Helper Functions ───
+-- Placed on state table so grid_ui.lua can call them.
 
--- Per-sample state, indexed by sample index
-local pad_amps = {}   -- playback boost per pad (E3 adjustable, 0.25–4.0, default 2.0)
+function state.effective_pre_level(track_idx)
+  return state.track_preserve_boosted[track_idx] and 1.0 or state.track_preserve[track_idx]
+end
 
--- Momentary / latch button state
-local solo_mode = false                   -- row 1 col 10: latch, play over loop without recording
-local buffer_muted = false                -- row 1 col 11: latch mute buffer + preserve 0
-local saved_preserve_for_mute = nil       -- saved preserve while buffer muted
-local preserve0_held = false              -- row 1 col 12: snap preserve to 0
-local saved_preserve_value = nil          -- saved value while preserve0 held
+function state.target_tracks()
+  if state.selected_track == 4 then
+    return {1, 2, 3}
+  else
+    return {state.selected_track}
+  end
+end
 
--- Tap tempo
-local tap_times = {}
-local TAP_TIMEOUT = 2.0
-local TAP_MIN_TAPS = 2
-local TAP_MAX_TAPS = 6
+function state.sample_to_grid(idx)
+  if not state.samples[idx] then return nil, nil end
+  return state.samples[idx].grid_col, state.samples[idx].grid_row
+end
 
--- Beat flash
-local beat_flash_time = 0
+function state.grid_to_sample(col, row)
+  if row < 3 or row > 16 then return nil end
+  if col < 1 or col > 16 then return nil end
+  if not state.grid_samples[row] then return nil end
+  return state.grid_samples[row][col]
+end
 
--- Shuffle flash
-local shuffle2_flash_time = 0
-local shuffle4_flash_time = 0
+-- Grid slot numbering: row 3 col 1 = 1, row 3 col 2 = 2, ..., row 16 col 16 = 224
+local function grid_slot_number(row, col)
+  return (row - 3) * 16 + col
+end
 
--- Clear all flash
-local clear_flash_time = 0
+local function is_prime(n)
+  if n < 2 then return false end
+  if n <= 3 then return true end
+  if n % 2 == 0 or n % 3 == 0 then return false end
+  local i = 5
+  while i * i <= n do
+    if n % i == 0 or n % (i + 2) == 0 then return false end
+    i = i + 6
+  end
+  return true
+end
 
--- Snap-to-power-of-2 flash
-local snap_pow2_flash_time = 0
+function state.is_prime_slot(row, col)
+  return is_prime(grid_slot_number(row, col))
+end
 
--- Snapshot state
-local grid_snapshots = {}  -- grid_snapshots[row][col] = base filename when snapshot saved
-local snapshot_flash_time = 0
-local snapshot_flash_pos = nil  -- {col=, row=} of last snapshot action
+function state.is_slot_occupied(r, c)
+  if state.grid_samples[r] and state.grid_samples[r][c] then return true end
+  if state.grid_cue_points[r] and state.grid_cue_points[r][c] then return true end
+  if state.grid_snapshots[r] and state.grid_snapshots[r][c] then return true end
+  return false
+end
 
--- Isolator state (toggle kills, row 1 cols 14-16)
-local iso_kills = {false, false, false}  -- [1]=low (col14), [2]=mid (col15), [3]=high (col16)
+function state.find_free_sample_slot()
+  for r = 3, 16 do
+    for c = 1, 16 do
+      if not state.is_prime_slot(r, c) and not state.is_slot_occupied(r, c) then
+        return r, c
+      end
+    end
+  end
+  return nil, nil
+end
 
--- Pitch shift state (row 3, cols 1-10)
-local pitch_values = {-12, -10, -7, -5, -2, 2, 5, 7, 10, 12}
-local active_pitch_shift = 0
--- Idle brightness by magnitude: ±2→4, ±5→7, ±7→9, ±10→11, ±12→13
-local pitch_idle_brightness = {13, 11, 9, 7, 4, 4, 7, 9, 11, 13}
+-- Cue points prefer prime slots (distributed across grid), then any free slot
+function state.find_free_cue_slot()
+  for r = 3, 16 do
+    for c = 1, 16 do
+      if state.is_prime_slot(r, c) and not state.is_slot_occupied(r, c) then
+        return r, c
+      end
+    end
+  end
+  for r = 3, 16 do
+    for c = 1, 16 do
+      if not state.is_slot_occupied(r, c) then
+        return r, c
+      end
+    end
+  end
+  return nil, nil
+end
 
--- Waveform display state (row 2)
-local waveform_brightness = {}
-local last_render_time = 0
-local RENDER_INTERVAL = 0.25
-
--- Record arm state machine (row 3, col 16)
-local rec_state = "idle"  -- "idle", "armed", "recording"
-
--- Hot swap state machine (row 3, col 15)
-local hotswap_state = "idle"  -- "idle", "armed", "staged"
-local hotswap_staged = nil    -- {idx, filepath, duration, bpm, beats} when staged
-local hotswap_saved_beat_bits = nil  -- saved beat_bits for cancel-from-staged
-
--- Iso recording: when user presses iso, we enter recording mode for one
--- full loop. The iso subdivision clock writes the user's state to the data
--- buffer. On subsequent passes, the data buffer drives the filters.
-
--- Preserve boost: snap to 100% while finger drumming, restore after one
--- full uninterrupted loop pass with no triggers.
-local preserve_boosted = false
-local trigger_this_loop = false
-
-local function effective_pre_level()
-  return preserve_boosted and 1.0 or preserve_value
+function state.find_free_snapshot_slot()
+  for r = 3, 16 do
+    for c = 1, 16 do
+      if not state.is_slot_occupied(r, c) then
+        return r, c
+      end
+    end
+  end
+  return nil, nil
 end
 
 -- ─── Helpers ───
-
--- Map sample index (1-based) to grid position {col, row}
-local function sample_to_grid(idx)
-  if not samples[idx] then return nil, nil end
-  return samples[idx].grid_col, samples[idx].grid_row
-end
-
--- Map grid position to sample index (1-based), or nil if not a sample pad
-local function grid_to_sample(col, row)
-  if row < 4 or row > 8 then return nil end
-  if col < 1 or col > 16 then return nil end
-  if not grid_samples[row] then return nil end
-  return grid_samples[row][col]
-end
 
 -- Get display name from filepath
 local function display_name(filepath)
@@ -173,34 +213,168 @@ local function truncate(str, max_len)
   return str
 end
 
+-- Refresh engine->softcut input routing for all tracks
+function state.refresh_input_routing()
+  for i = 1, 3 do
+    local level = 0
+    if state.tracks[i].capturing then
+      level = 1.0  -- force on during recording
+    elseif i == state.recording_target then
+      local has_iso = state.track_iso_kills[i][1] or state.track_iso_kills[i][2] or state.track_iso_kills[i][3]
+      level = has_iso and 0 or 1.0
+    end
+    state.tracks[i]:set_engine_input(level)
+  end
+end
+
+-- Global engine->softcut bus
+local function refresh_global_eng_cut()
+  audio.level_eng_cut(ENG_LEVEL)
+end
+
+-- ─── Snapshots ───
+
+local snapshot_dir_ready = false
+
+local function ensure_snapshot_dir()
+  if not snapshot_dir_ready then
+    os.execute("mkdir -p '" .. SNAPSHOT_DIR .. "'")
+    snapshot_dir_ready = true
+  end
+end
+
+function state.save_snapshot()
+  ensure_snapshot_dir()
+  local row, col = state.find_free_snapshot_slot()
+  if not row then
+    print("erasmus: no free grid slot for snapshot")
+    return
+  end
+
+  local bpm = params:get("clock_tempo")
+  local b1 = state.tracks[1].num_beats
+  local b2 = state.tracks[2].num_beats
+  local b3 = state.tracks[3].num_beats
+  local base = string.format("snap_r%dc%d_bpm%g_b%d_%d_%d", row, col, bpm, b1, b2, b3)
+
+  for ti = 1, 3 do
+    local t = state.tracks[ti]
+    local off = t.buffer_offset
+    local dur = t.buffer_dur
+    if dur > 0 then
+      softcut.buffer_write_mono(SNAPSHOT_DIR .. base .. "_t" .. ti .. "_L.wav", off, dur, 1)
+      softcut.buffer_write_mono(SNAPSHOT_DIR .. base .. "_t" .. ti .. "_R.wav", off, dur, 2)
+    end
+  end
+
+  local snap = {grid_row = row, grid_col = col, base = base, bpm = bpm, beats = {b1, b2, b3}}
+  table.insert(state.snapshots, snap)
+  if not state.grid_snapshots[row] then state.grid_snapshots[row] = {} end
+  state.grid_snapshots[row][col] = #state.snapshots
+
+  state.snapshot_flash_time = util.time()
+  state.grid_dirty = true
+  state.is_screen_dirty = true
+  print("erasmus: saved snapshot to " .. base)
+end
+
+function state.load_snapshot(row, col)
+  if not state.grid_snapshots[row] or not state.grid_snapshots[row][col] then return end
+  local snap_idx = state.grid_snapshots[row][col]
+  local snap = state.snapshots[snap_idx]
+  if not snap then return end
+
+  -- Clear writing names before restoring
+  for ti = 1, 3 do
+    state.track_writing_name[ti] = nil
+  end
+
+  -- Restore state for all 3 tracks (load_state BEFORE tempo change so
+  -- set_tempo computes rate = loop_dur / loop_dur = 1.0 correctly)
+  for ti = 1, 3 do
+    local t = state.tracks[ti]
+    t:load_state(snap.bpm, snap.beats[ti])
+
+    local path_l = SNAPSHOT_DIR .. snap.base .. "_t" .. ti .. "_L.wav"
+    local path_r = SNAPSHOT_DIR .. snap.base .. "_t" .. ti .. "_R.wav"
+    local off = t.buffer_offset
+    local dur = t.buffer_dur
+    if dur > 0 then
+      softcut.buffer_read_mono(path_l, 0, off, dur, 1, 0)
+      softcut.buffer_read_mono(path_r, 0, off, dur, 2, 0)
+    end
+
+    -- Reset pitch, reverse, and iso state
+    t.pitch_shift_semitones = 0
+    t:set_pitch_shift(0)
+    state.track_reversed[ti] = false
+    t:set_reversed(false)
+    state.track_iso_kills[ti] = {false, false, false}
+    t:update_iso(false, false, false)
+  end
+  params:set("clock_tempo", snap.bpm)
+
+  state.refresh_input_routing()
+  state.snapshot_flash_time = util.time()
+  state.grid_dirty = true
+  state.is_screen_dirty = true
+  print("erasmus: loaded snapshot " .. snap.base)
+end
+
+local function scan_snapshots()
+  ensure_snapshot_dir()
+  state.snapshots = {}
+  state.grid_snapshots = {}
+
+  local entries = util.scandir(SNAPSHOT_DIR)
+  if not entries then return end
+
+  -- Group by base name (one base = one scene, 6 WAV files)
+  local seen = {}
+  for _, entry in ipairs(entries) do
+    local base = entry:match("^(snap_r%d+c%d+_bpm[%d%.]+_b%d+_%d+_%d+)_t%d_[LR]%.wav$")
+    if base and not seen[base] then
+      seen[base] = true
+      local row, col, bpm, b1, b2, b3 = base:match(
+        "^snap_r(%d+)c(%d+)_bpm([%d%.]+)_b(%d+)_(%d+)_(%d+)$")
+      row = tonumber(row)
+      col = tonumber(col)
+      bpm = tonumber(bpm)
+      b1 = tonumber(b1)
+      b2 = tonumber(b2)
+      b3 = tonumber(b3)
+      if row and col and bpm and b1 and b2 and b3 then
+        local snap = {grid_row = row, grid_col = col, base = base, bpm = bpm, beats = {b1, b2, b3}}
+        table.insert(state.snapshots, snap)
+        if not state.grid_snapshots[row] then state.grid_snapshots[row] = {} end
+        state.grid_snapshots[row][col] = #state.snapshots
+        print("erasmus: found snapshot " .. base)
+      end
+    end
+  end
+end
+
 -- Assign per-group brightness via greedy graph coloring.
--- Builds adjacency from the grid layout, then processes groups
--- most-constrained-first, picking the brightness in [4,13] that
--- maximizes the minimum difference from all assigned neighbors.
--- The group adjacency graph is always planar (2D grid packing),
--- so by the four-color theorem ≤4 distinct levels are needed.
--- With range [4,13] and min_diff=3 that gives {4,7,10,13} — always solvable.
 local function compute_group_brightness(num_groups)
-  group_brightness = {}
+  state.group_brightness = {}
   if num_groups <= 1 then
-    group_brightness[1] = 8
+    state.group_brightness[1] = 8
     return
   end
 
   local MIN_BRIGHT = 4
   local MAX_BRIGHT = 13
 
-  -- Build group adjacency from grid positions (4-connected)
   local adj = {}
-  for g = 1, num_groups do adj[g] = {} end
+  for grp = 1, num_groups do adj[grp] = {} end
   local offsets = {{0, 1}, {0, -1}, {1, 0}, {-1, 0}}
-  for idx = 1, num_samples do
-    local s = samples[idx]
+  for idx = 1, state.num_samples do
+    local s = state.samples[idx]
     local g1 = s.group_idx
     for _, off in ipairs(offsets) do
       local nr, nc = s.grid_row + off[1], s.grid_col + off[2]
-      if grid_samples[nr] and grid_samples[nr][nc] then
-        local g2 = samples[grid_samples[nr][nc]].group_idx
+      if state.grid_samples[nr] and state.grid_samples[nr][nc] then
+        local g2 = state.samples[state.grid_samples[nr][nc]].group_idx
         if g1 ~= g2 then
           adj[g1][g2] = true
           adj[g2][g1] = true
@@ -209,9 +383,8 @@ local function compute_group_brightness(num_groups)
     end
   end
 
-  -- Process groups most-constrained-first (most neighbors)
   local order = {}
-  for g = 1, num_groups do order[g] = g end
+  for grp = 1, num_groups do order[grp] = grp end
   table.sort(order, function(a, b)
     local ca, cb = 0, 0
     for _ in pairs(adj[a]) do ca = ca + 1 end
@@ -221,20 +394,17 @@ local function compute_group_brightness(num_groups)
 
   local mid = math.floor((MIN_BRIGHT + MAX_BRIGHT) / 2)
 
-  for _, g in ipairs(order) do
-    -- Collect assigned neighbor brightnesses
+  for _, grp in ipairs(order) do
     local neighbor_vals = {}
-    for nb, _ in pairs(adj[g]) do
-      if group_brightness[nb] then
-        table.insert(neighbor_vals, group_brightness[nb])
+    for nb, _ in pairs(adj[grp]) do
+      if state.group_brightness[nb] then
+        table.insert(neighbor_vals, state.group_brightness[nb])
       end
     end
 
     if #neighbor_vals == 0 then
-      group_brightness[g] = mid
+      state.group_brightness[grp] = mid
     else
-      -- Pick value that maximizes min distance to assigned neighbors;
-      -- ties broken by proximity to range midpoint (visual balance)
       local best_val = mid
       local best_min_dist = -1
       for v = MIN_BRIGHT, MAX_BRIGHT do
@@ -248,12 +418,12 @@ local function compute_group_brightness(num_groups)
           best_val = v
         end
       end
-      group_brightness[g] = best_val
+      state.group_brightness[grp] = best_val
     end
   end
 end
 
--- Get audio file duration in seconds via soxi
+-- Get audio file duration in seconds
 local function get_file_duration(filepath)
   local info = _norns.sound_file_inspect(filepath)
   if info and info[1] > 0 then
@@ -266,19 +436,42 @@ end
 
 local AUDIO_EXTENSIONS = {wav=true, flac=true, aif=true, aiff=true}
 
--- Check if a filename is an audio file
 local function is_audio_file(name)
   local ext = name:match("%.([^%.]+)$")
   return ext and AUDIO_EXTENSIONS[ext:lower()]
 end
 
--- Collect audio files from a directory using util.scandir (norns native)
+-- Parse a config.txt file for per-sample overrides.
+-- Format: one entry per line, "sample_name: rate=X amp=Y" (fields optional).
+-- Lines starting with # are comments. Blank lines are skipped.
+-- Returns table keyed by sample name (without extension).
+local function parse_sample_config(dir_path)
+  local config = {}
+  local f = io.open(dir_path .. "config.txt", "r")
+  if not f then return config end
+  for line in f:lines() do
+    line = line:match("^%s*(.-)%s*$")  -- trim
+    if line ~= "" and not line:match("^#") then
+      local name, rest = line:match("^([^:]+):%s*(.+)$")
+      if name and rest then
+        name = name:match("^%s*(.-)%s*$")
+        local entry = {}
+        for key, val in rest:gmatch("(%w+)%s*=%s*([%d%.%-]+)") do
+          entry[key] = tonumber(val)
+        end
+        config[name] = entry
+      end
+    end
+  end
+  f:close()
+  return config
+end
+
 local function collect_audio_files(dir_path)
   local files = {}
   local entries = util.scandir(dir_path)
   if not entries then return files end
   for _, entry in ipairs(entries) do
-    -- Skip directories (util.scandir appends / to dirs)
     if not entry:match("/$") and is_audio_file(entry) then
       table.insert(files, dir_path .. entry)
     end
@@ -288,66 +481,66 @@ local function collect_audio_files(dir_path)
 end
 
 local function scan_samples()
-  samples = {}
-  num_samples = 0
-  pad_amps = {}
-  grid_samples = {}
-  group_names = {}
+  state.samples = {}
+  state.num_samples = 0
+  state.pad_amps = {}
+  state.grid_samples = {}
+  state.group_names = {}
 
-  -- Ensure directory exists
   os.execute("mkdir -p " .. SAMPLE_DIR)
 
-  -- Build ordered list of groups: {name, files}
   local groups = {}
 
-  -- Scan root directory
   local entries = util.scandir(SAMPLE_DIR)
   if not entries then
     print("erasmus: could not scan " .. SAMPLE_DIR)
     return
   end
 
-  -- Separate loose files and subdirectories
   local root_files = {}
   local subdirs = {}
   for _, entry in ipairs(entries) do
     if entry:match("/$") then
-      table.insert(subdirs, entry)
+      local dir_name = entry:match("^(.-)/$") or entry
+      if dir_name ~= "snapshots" then
+        table.insert(subdirs, entry)
+      end
     elseif is_audio_file(entry) then
       table.insert(root_files, SAMPLE_DIR .. entry)
     end
   end
 
-  -- Root loose files first
   table.sort(root_files)
   if #root_files > 0 then
-    table.insert(groups, {name = "(root)", files = root_files})
+    local root_config = parse_sample_config(SAMPLE_DIR)
+    table.insert(groups, {name = "(root)", files = root_files, config = root_config})
   end
 
-  -- Then subdirectories, sorted alphabetically
   table.sort(subdirs)
   for _, subdir in ipairs(subdirs) do
     local dir_name = subdir:match("^(.-)/$") or subdir
-    local dir_files = collect_audio_files(SAMPLE_DIR .. subdir)
+    local dir_path = SAMPLE_DIR .. subdir
+    local dir_files = collect_audio_files(dir_path)
     if #dir_files > 0 then
-      table.insert(groups, {name = dir_name, files = dir_files})
+      local dir_config = parse_sample_config(dir_path)
+      table.insert(groups, {name = dir_name, files = dir_files, config = dir_config})
     end
   end
 
-  -- Flood-fill layout into grid rows 4-8, cols 1-16
-  local MIN_ROW, MAX_ROW = 4, 8
+  -- Flood-fill layout into grid rows 3-16, cols 1-16 (224 slots)
+  local MIN_ROW, MAX_ROW = 3, 16
   local MIN_COL, MAX_COL = 1, 16
 
-  -- Occupied tracking table
   local occupied = {}
   for r = MIN_ROW, MAX_ROW do
     occupied[r] = {}
     for c = MIN_COL, MAX_COL do
-      occupied[r][c] = false
+      -- Reserve prime slots for cue points, and existing snapshot slots
+      local has_snap = state.grid_snapshots[r] and state.grid_snapshots[r][c]
+      occupied[r][c] = state.is_prime_slot(r, c) or (has_snap ~= nil)
     end
   end
 
-  -- Find first empty cell scanning left-to-right, top-to-bottom
   local function find_first_empty()
     for r = MIN_ROW, MAX_ROW do
       for c = MIN_COL, MAX_COL do
@@ -357,9 +550,6 @@ local function scan_samples()
     return nil, nil
   end
 
-  -- Priority-queue BFS flood-fill: returns `count` cells in row-major order.
-  -- Priority = Chebyshev distance from seed (expands in concentric square
-  -- rings for compact shapes), tie-broken by row-major for determinism.
   local function flood_fill(seed_row, seed_col, count)
     local cells = {}
     local frontier = {{seed_row, seed_col}}
@@ -375,13 +565,11 @@ local function scan_samples()
         table.insert(cells, {r, c})
         occupied[r][c] = true
 
-        -- Add 4-connected empty neighbors to frontier
         local neighbors = {{r-1, c}, {r+1, c}, {r, c-1}, {r, c+1}}
         for _, nb in ipairs(neighbors) do
           local nr, nc = nb[1], nb[2]
           if nr >= MIN_ROW and nr <= MAX_ROW and nc >= MIN_COL and nc <= MAX_COL
             and not occupied[nr][nc] and not in_frontier[nr * 100 + nc] then
-            -- Chebyshev distance → square rings; row-major tiebreak
             local dist = math.max(math.abs(nr - seed_row), math.abs(nc - seed_col))
             local key_new = dist * 10000 + nr * 100 + nc
             local inserted = false
@@ -404,7 +592,6 @@ local function scan_samples()
       end
     end
 
-    -- Sort placed cells row-major so alphabetical sample order reads L→R, T→B
     table.sort(cells, function(a, b)
       if a[1] ~= b[1] then return a[1] < b[1] end
       return a[2] < b[2]
@@ -415,7 +602,7 @@ local function scan_samples()
 
   for g_idx = 1, #groups do
     local group = groups[g_idx]
-    local file_count = math.min(#group.files, MAX_SAMPLES - num_samples)
+    local file_count = math.min(#group.files, MAX_SAMPLES - state.num_samples)
     if file_count <= 0 then break end
 
     local seed_r, seed_c = find_first_empty()
@@ -424,235 +611,74 @@ local function scan_samples()
     local cells = flood_fill(seed_r, seed_c, file_count)
 
     for fi = 1, #cells do
-      if fi > #group.files or num_samples >= MAX_SAMPLES then break end
+      if fi > #group.files or state.num_samples >= MAX_SAMPLES then break end
       local r, c = cells[fi][1], cells[fi][2]
       local filepath = group.files[fi]
-      num_samples = num_samples + 1
-      samples[num_samples] = {
+      local name = display_name(filepath)
+      local cfg = group.config and group.config[name] or {}
+      state.num_samples = state.num_samples + 1
+      state.samples[state.num_samples] = {
         filepath = filepath,
-        name = display_name(filepath),
-        slot = num_samples - 1,
+        name = name,
+        slot = state.num_samples - 1,
         grid_row = r,
         grid_col = c,
         group_idx = g_idx,
+        rate = cfg.rate or 1.0,
       }
-      pad_amps[num_samples] = 2.0
-      if not grid_samples[r] then grid_samples[r] = {} end
-      grid_samples[r][c] = num_samples
+      state.pad_amps[state.num_samples] = cfg.amp or 2.0
+      if not state.grid_samples[r] then state.grid_samples[r] = {} end
+      state.grid_samples[r][c] = state.num_samples
     end
 
-    group_names[g_idx] = group.name
+    state.group_names[g_idx] = group.name
 
     print("erasmus: group " .. g_idx .. " [" .. group.name .. "] " ..
       #cells .. " samples (flood-fill from row " .. seed_r .. ", col " .. seed_c .. ")")
   end
 
-  -- Compute per-group brightness (needs grid layout to detect adjacency)
   compute_group_brightness(#groups)
 
-  print("erasmus: " .. num_samples .. " total samples in " ..
+  print("erasmus: " .. state.num_samples .. " total samples in " ..
     #groups .. " groups")
 end
 
--- Add per-sample amplitude params (saved in presets)
--- IDs are index-based; stable as long as sample folder contents don't change.
 local function add_sample_params()
-  if num_samples == 0 then return end
-  params:add_group("sample_levels", "Sample Levels", num_samples)
-  for i = 1, num_samples do
+  if state.num_samples == 0 then return end
+  params:add_group("sample_levels", "Sample Levels", state.num_samples)
+  for i = 1, state.num_samples do
     params:add_control(
       "sample_" .. i .. "_amp",
-      samples[i].name,
+      state.samples[i].name,
       controlspec.new(0.25, 4.0, 'lin', 0.01, 2.0, "x")
     )
     params:set_action("sample_" .. i .. "_amp", function(value)
-      pad_amps[i] = value
-      is_screen_dirty = true
+      state.pad_amps[i] = value
+      state.is_screen_dirty = true
     end)
   end
 end
 
 local function load_samples()
   clock.run(function()
-    for i = 1, num_samples do
-      engine.mxsamplesload(samples[i].slot, samples[i].filepath)
-      print("  loading [" .. i .. "/" .. num_samples .. "] " .. samples[i].name)
+    for i = 1, state.num_samples do
+      engine.mxsamplesload(state.samples[i].slot, state.samples[i].filepath)
+      print("  loading [" .. i .. "/" .. state.num_samples .. "] " .. state.samples[i].name)
       if i % 10 == 0 then
         clock.sleep(0.5)
       end
     end
     clock.sleep(1.0)
     print("erasmus: all samples loaded")
-    grid_dirty = true
-    is_screen_dirty = true
+    state.grid_dirty = true
+    state.is_screen_dirty = true
   end)
-end
-
--- ─── Binary Beat Bits (UI helper, no looper interaction) ───
-local function set_beat_bits(num_beats)
-  local val = num_beats - 1
-  for i = 1, 5 do
-    beat_bits[i] = val >= beat_powers[i]
-    if beat_bits[i] then val = val - beat_powers[i] end
-  end
-end
-
--- ─── Buffer Snapshots ───
-local snapshot_dir_ready = false
-
-local function ensure_snapshot_dir()
-  if not snapshot_dir_ready then
-    os.execute("mkdir -p '" .. SNAPSHOT_DIR .. "'")
-    snapshot_dir_ready = true
-  end
-end
-
-local function save_snapshot(col, row)
-  ensure_snapshot_dir()
-  local dur = looper:get_buffer_dur()
-  local bpm = params:get("clock_tempo")
-  local beats = looper:get_num_beats()
-  local base = string.format("snapshot_r%d_c%d_bpm%g_beats%d", row, col, bpm, beats)
-  local path = SNAPSHOT_DIR .. base .. ".wav"
-  print("erasmus: saving snapshot to " .. path .. " (" .. string.format("%.2fs", dur) .. ")")
-  softcut.buffer_write_stereo(path, 0, dur)
-  if not grid_snapshots[row] then grid_snapshots[row] = {} end
-  grid_snapshots[row][col] = base
-  snapshot_flash_time = util.time()
-  snapshot_flash_pos = {col = col, row = row}
-  grid_dirty = true
-  is_screen_dirty = true
-end
-
-local function load_snapshot(col, row)
-  local base = grid_snapshots[row][col]
-
-  -- Parse BPM and beats from snapshot filename
-  local snap_bpm, snap_beats = base:match("bpm([%d%.]+)_beats(%d+)")
-  snap_bpm = tonumber(snap_bpm)
-  snap_beats = tonumber(snap_beats)
-
-  if snap_bpm and snap_beats then
-    -- Reset pitch shift before restoring state so _apply_rate uses rate=1.0
-    active_pitch_shift = 0
-    looper.pitch_shift_semitones = 0
-    -- Restore looper state: sets buffer_dur = loop_dur, rate = 1.0, playhead to 0, resets iso_data
-    looper:load_state(snap_bpm, snap_beats)
-    -- Sync system clock (param action calls set_tempo which keeps rate at 1.0)
-    params:set("clock_tempo", snap_bpm)
-    -- Reset iso state
-    iso_kills = {false, false, false}
-    looper:update_iso(false, false, false)
-    -- Update grid UI beat bits
-    set_beat_bits(snap_beats)
-  end
-
-  local dur = looper:get_buffer_dur()
-  local path = SNAPSHOT_DIR .. base .. ".wav"
-  print("erasmus: loading snapshot from " .. path .. " (" .. string.format("%.2fs", dur) .. ")")
-  softcut.buffer_read_stereo(path, 0, 0, dur)
-  snapshot_flash_time = util.time()
-  snapshot_flash_pos = {col = col, row = row}
-  grid_dirty = true
-  is_screen_dirty = true
-end
-
--- ─── Sample Triggering ───
-local function trigger_sample(idx)
-  if idx < 1 or idx > num_samples then return end
-  if rec_state == "armed" and not looper.capturing then
-    looper:start_recording()
-    rec_state = "recording"
-  end
-  local s = samples[idx]
-
-  local amp = pad_amps[idx] or 2.0
-  engine.mxsampleson(idx, s.slot, 1.0, amp, 0.0, 0.015, 1.0, 0.9, 0.5, 20000, 10, 0.0, 0.0, 0)
-  current_playing_pad = idx
-  grid_dirty = true
-  is_screen_dirty = true
-end
-
-
--- ─── Binary Beat Length ───
-local function compute_num_beats()
-  local val = 0
-  for i = 1, 5 do
-    if beat_bits[i] then val = val + beat_powers[i] end
-  end
-  looper:set_num_beats(val + 1)  -- range 1-32
-  grid_dirty = true
-  is_screen_dirty = true
-end
-
-local SNAP_TARGET_BPM = 90
-
-local function snap_to_power_of_2()
-  local nb = looper:get_num_beats()
-  -- Already a power of 2? Nothing to do.
-  if nb > 0 and (nb & (nb - 1)) == 0 then return end
-
-  -- Find lower and upper powers of 2
-  local lower = 1
-  while lower * 2 < nb do lower = lower * 2 end
-  local upper = lower * 2
-  if upper > 32 then upper = 32 end
-
-  -- Pick nearest; ties broken by which tempo lands closer to 90 BPM
-  local target
-  local dist_lo = nb - lower
-  local dist_hi = upper - nb
-  if dist_lo < dist_hi then
-    target = lower
-  elseif dist_hi < dist_lo then
-    target = upper
-  else
-    -- Equidistant: pick whichever resulting tempo is closer to target BPM
-    local current_tempo = params:get("clock_tempo")
-    local tempo_lo = lower * current_tempo / nb
-    local tempo_hi = upper * current_tempo / nb
-    if math.abs(tempo_lo - SNAP_TARGET_BPM) <= math.abs(tempo_hi - SNAP_TARGET_BPM) then
-      target = lower
-    else
-      target = upper
-    end
-  end
-
-  -- New tempo preserves loop duration: new_tempo = target * old_tempo / old_beats
-  local new_tempo = util.clamp(target * params:get("clock_tempo") / nb, 20, 300)
-
-  -- Apply atomically: batch prevents intermediate resize/rate changes
-  set_beat_bits(target)
-  looper:begin_batch()
-  params:set("clock_tempo", new_tempo)
-  compute_num_beats()
-  looper:end_batch()
-end
-
--- Find nearest empty grid slot (no sample, no snapshot) starting from
--- (start_col, start_row), scanning right then down. Returns col, row or nil.
-local function find_empty_slot(start_col, start_row)
-  local col, row = start_col, start_row
-  while row <= 8 do
-    while col <= 16 do
-      local has_sample = grid_to_sample(col, row) ~= nil
-      local has_snapshot = grid_snapshots[row] and grid_snapshots[row][col]
-      if not has_sample and not has_snapshot then
-        return col, row
-      end
-      col = col + 1
-    end
-    col = 1
-    row = row + 1
-  end
-  return nil, nil
 end
 
 -- ─── Record Arm Helpers ───
 
--- Given a captured duration, find integer beat count B (1-32) where
--- 60*B/D is in [60,119]. Prefer largest power of 2; fallback to B
--- closest to 90 BPM; last resort clamp to B=1.
+local SNAP_TARGET_BPM = 90
+
 local function calculate_bpm(duration)
   local valid = {}
   for b = 1, 32 do
@@ -666,7 +692,6 @@ local function calculate_bpm(duration)
     return 60 / duration, 1
   end
 
-  -- Prefer largest power of 2
   local best_pow2 = nil
   for _, b in ipairs(valid) do
     if b > 0 and (b & (b - 1)) == 0 then
@@ -679,7 +704,6 @@ local function calculate_bpm(duration)
     return 60 * best_pow2 / duration, best_pow2
   end
 
-  -- No power of 2 fits: pick B giving BPM closest to 90
   local best_b = valid[1]
   local best_dist = math.abs(60 * valid[1] / duration - 90)
   for i = 2, #valid do
@@ -692,523 +716,205 @@ local function calculate_bpm(duration)
   return 60 * best_b / duration, best_b
 end
 
+-- ─── Sample Triggering ───
+function state.stop_sample(idx)
+  if idx < 1 or idx > state.num_samples then return end
+  engine.mxsamplesoff(idx)
+  if state.current_playing_pad == idx then
+    state.current_playing_pad = nil
+  end
+end
+
+function state.trigger_sample(idx)
+  if idx < 1 or idx > state.num_samples then return end
+  -- If record armed, start recording on recording_target track
+  if state.rec_state == "armed" and not state.tracks[state.recording_target].capturing then
+    state.tracks[state.recording_target]:start_recording()
+    softcut.level_input_cut(1, state.tracks[state.recording_target].voice_l, 1.0)
+    softcut.level_input_cut(2, state.tracks[state.recording_target].voice_r, 1.0)
+    refresh_global_eng_cut()
+    state.rec_state = "recording"
+  end
+  local s = state.samples[idx]
+
+  local amp = state.pad_amps[idx] or 2.0
+  local rate = s.rate or 1.0
+  engine.mxsampleson(idx, s.slot, rate, amp, 0.0, 0.015, 1.0, 0.9, 0.5, 20000, 10, 0.0, 0.0, 0)
+  state.current_playing_pad = idx
+
+  -- Set name for writing into name_data buffer
+  local ti = state.recording_target
+  state.track_writing_name[ti] = s.name
+
+  -- Boost preserve to 100% on recording_target track while finger drumming
+  state.track_trigger_this_loop[ti] = true
+  if not state.track_preserve_boosted[ti] and not state.track_preserve0_held[ti] then
+    state.track_preserve_boosted[ti] = true
+    state.tracks[ti]:set_pre_level(1.0)
+  end
+
+  state.grid_dirty = true
+  state.is_screen_dirty = true
+end
+
 local function stop_recording()
-  local duration = looper:stop_recording()
+  local t = state.tracks[state.recording_target]
+  local duration = t:stop_recording()
   local bpm, beats = calculate_bpm(duration)
-  active_pitch_shift = 0
-  looper.pitch_shift_semitones = 0
-  looper:load_state(bpm, beats)  -- resets iso_data via init_iso_data
+  for j = 1, 3 do state.tracks[j].pitch_shift_semitones = 0 end
+  t:load_state(bpm, beats)
   params:set("clock_tempo", bpm)
-  set_beat_bits(beats)
-  looper:set_pre_level(effective_pre_level())
-  iso_kills = {false, false, false}
-  looper:update_iso(false, false, false)
-  local snap_col, snap_row = find_empty_slot(1, 8)
-  if snap_col then
-    save_snapshot(snap_col, snap_row)
-  end
-  rec_state = "idle"
-  grid_dirty = true
-  is_screen_dirty = true
+  for j = 1, 3 do state.tracks[j]:set_pitch_shift(0) end
+  t:set_pre_level(state.effective_pre_level(state.recording_target))
+  state.track_iso_kills[state.recording_target] = {false, false, false}
+  t:update_iso(false, false, false)
+  state.refresh_input_routing()
+  refresh_global_eng_cut()
+  state.rec_state = "idle"
+  state.grid_dirty = true
+  state.is_screen_dirty = true
 end
 
--- ─── Hot Swap Commit ───
-local function commit_hotswap()
-  if not hotswap_staged then return end
-  local hs = hotswap_staged
-  -- Re-read file into position 0 as full stereo
-  looper:commit_staging(hs.filepath, hs.duration)
-  -- Reset pitch shift
-  active_pitch_shift = 0
-  looper.pitch_shift_semitones = 0
-  -- Set looper state (buffer_dur, rate=1.0, playhead to 0, resets iso_data)
-  looper:load_state(hs.bpm, hs.beats)
-  -- Sync system clock
-  params:set("clock_tempo", hs.bpm)
-  -- Restore preserve level
-  looper:set_pre_level(effective_pre_level())
-  -- Reset iso state
-  iso_kills = {false, false, false}
-  looper:update_iso(false, false, false)
-  -- Clear hot swap state
-  hotswap_state = "idle"
-  hotswap_staged = nil
-  hotswap_saved_beat_bits = nil
-  looper:request_waveform()
-  grid_dirty = true
-  is_screen_dirty = true
-end
+-- ─── Screen Redraw (3-column scrolling name display) ───
 
+-- Column layout
+local COL_X = {1, 44, 87}
+local COL_W = 42
+local NAME_MAX_CHARS = 7
+local ROW_H = 8
+local HEADER_H = 8
+local NUM_ROWS = 7       -- rows visible per column (3 past + center + 3 future)
+local CENTER_ROW = 4     -- which row is the "now" row (1-indexed)
+local GAP_TOLERANCE = 4  -- subs of nil between same name counts as continuous
 
--- ─── Tap Tempo ───
-local function handle_tap_tempo()
-  local now = util.time()
+-- Per-track brightness: center row (playhead) and dim (surrounding)
+local COL_BRIGHT = {15, 9, 5}
+local COL_DIM = {8, 5, 3}
 
-  -- Reset if too long since last tap
-  if #tap_times > 0 and (now - tap_times[#tap_times]) > TAP_TIMEOUT then
-    tap_times = {}
-  end
+-- Collect deduplicated name entries around current sub for a track.
+-- Returns {past={}, future={}} where each entry is {name=, offset=}.
+-- past is ordered nearest-first, future is ordered nearest-first.
+local function collect_names(track, subs_per_beat)
+  local total = track:name_total_subs()
+  if total == 0 then return {past = {}, future = {}} end
 
-  table.insert(tap_times, now)
-  if #tap_times > TAP_MAX_TAPS then
-    table.remove(tap_times, 1)
-  end
+  local cur = track.iso_sub % total
+  local half = math.floor(total / 2)
 
-  if #tap_times >= TAP_MIN_TAPS then
-    local total = tap_times[#tap_times] - tap_times[1]
-    local avg = total / (#tap_times - 1)
-    local bpm = 60 / avg
-    bpm = util.clamp(bpm, 20, 300)
-    params:set("clock_tempo", bpm)
-  end
-end
+  -- Scan outward, collect name changes (deduplicate consecutive runs)
+  local past = {}   -- offset < 0
+  local future = {} -- offset >= 0
 
--- ─── Grid Key Handler ───
-function grid_key(col, row, z)
-  -- ── Row 1, cols 1-5: Binary beat length ──
-  if row == 1 and col >= 1 and col <= 5 then
-    if z == 1 then
-      beat_bits[col] = not beat_bits[col]
-      compute_num_beats()
-    end
-    return
-  end
-
-  -- ── Row 1, cols 6-16: Function buttons (all on row 1) ──
-  if row == 1 and col >= 6 then
-    if col == 6 then
-      -- Preserve 0% (momentary hold): mute output + overwrite buffer
-      if z == 1 then
-        preserve0_held = true
-        saved_preserve_value = preserve_value
-        preserve_value = 0
-        looper:set_pre_level(0)
-        looper:set_output_muted(true)
-      else
-        preserve0_held = false
-        if saved_preserve_value then
-          preserve_value = saved_preserve_value
-          looper:set_pre_level(effective_pre_level())
-          saved_preserve_value = nil
-        end
-        if not buffer_muted then
-          looper:set_output_muted(false)
-        end
+  -- Scan forward (future): from cur to cur + half
+  local last_name = nil
+  local gap = 0
+  for off = 0, half do
+    local sub = (cur + off) % total
+    local name = track.name_data[sub]
+    if name then
+      if name ~= last_name or gap > GAP_TOLERANCE then
+        table.insert(future, {name = name, offset = off})
+        last_name = name
       end
-    elseif col == 7 and z == 1 then
-      -- Solo mode (latch toggle)
-      solo_mode = not solo_mode
-      looper:set_solo_mode(solo_mode)
-    elseif col == 8 and z == 1 then
-      -- Buffer mute (latch toggle)
-      if not buffer_muted then
-        buffer_muted = true
-        saved_preserve_for_mute = preserve_value
-        preserve_value = 0
-        looper:set_pre_level(0)
-        looper:set_buffer_muted(true)
-      else
-        buffer_muted = false
-        if saved_preserve_for_mute then
-          preserve_value = saved_preserve_for_mute
-          looper:set_pre_level(effective_pre_level())
-          saved_preserve_for_mute = nil
-        end
-        looper:set_buffer_muted(false)
-      end
-    elseif col == 9 and z == 1 then
-      -- Clear all: buffer + preserve + solo + mute + iso + boost
-      looper:clear_buffer()
-      preserve_value = 0.98
-      preserve_boosted = false
-      trigger_this_loop = false
-      looper:set_pre_level(preserve_value)
-      solo_mode = false
-      looper:set_solo_mode(false)
-      buffer_muted = false
-      saved_preserve_for_mute = nil
-      looper:set_buffer_muted(false)
-      iso_kills = {false, false, false}
-      looper:update_iso(false, false, false)
-      looper:clear_iso_data()
-      clear_flash_time = util.time()
-    elseif col == 10 and z == 1 then
-      -- Snap to nearest power-of-2 beats
-      snap_to_power_of_2()
-      snap_pow2_flash_time = util.time()
-    elseif col == 11 and z == 1 then
-      -- Tap tempo
-      handle_tap_tempo()
-    elseif col == 12 and z == 1 then
-      -- Shuffle by 1/2 beat
-      looper:beat_shuffle(0.5)
-      shuffle2_flash_time = util.time()
-    elseif col == 13 and z == 1 then
-      -- Shuffle by 1/4 beat
-      looper:beat_shuffle(0.25)
-      shuffle4_flash_time = util.time()
-    elseif col >= 14 and col <= 16 and z == 1 then
-      -- Isolator kill toggles (14=low, 15=mid, 16=high)
-      local idx = col - 13
-      iso_kills[idx] = not iso_kills[idx]
-      looper:update_iso(iso_kills[1], iso_kills[2], iso_kills[3])
-      -- Stamp current filter state at this position in the data buffer.
-      -- On subsequent loops, the iso clock fires this event and the
-      -- filter transitions here. Sample-and-hold between events.
-      looper:set_iso_at(looper.iso_sub, iso_kills)
-      print(string.format("iso: set sub %d → {%s,%s,%s}",
-        looper.iso_sub,
-        tostring(iso_kills[1]), tostring(iso_kills[2]), tostring(iso_kills[3])))
-    end
-    grid_dirty = true
-    is_screen_dirty = true
-    return
-  end
-
-  -- ── Row 2: Waveform display / jump-to-position ──
-  if row == 2 and z == 1 then
-    if hotswap_state == "staged" then
-      commit_hotswap()
-    end
-    if rec_state == "armed" and not looper.capturing then
-      looper:start_recording()
-      rec_state = "recording"
-    end
-    local fraction = (col - 1) / 16
-    looper:jump_to_position(fraction)
-    -- Boost preserve to 100% while jumping around the buffer
-    trigger_this_loop = true
-    if not preserve_boosted and not preserve0_held and not buffer_muted then
-      preserve_boosted = true
-      looper:set_pre_level(1.0)
-    end
-    grid_dirty = true
-    return
-  end
-
-  -- ── Row 3, cols 1-10: Pitch shift (cumulative) ──
-  if row == 3 and col >= 1 and col <= 10 and z == 1 then
-    active_pitch_shift = active_pitch_shift + pitch_values[col]
-    looper:set_pitch_shift(active_pitch_shift)
-    grid_dirty = true
-    is_screen_dirty = true
-    return
-  end
-
-  -- ── Row 3, col 15: Hot swap arm ──
-  if row == 3 and col == 15 and z == 1 then
-    if hotswap_state == "idle" then
-      -- Guard: don't arm if recording is active
-      if rec_state ~= "idle" then return end
-      hotswap_state = "armed"
-    elseif hotswap_state == "armed" then
-      hotswap_state = "idle"
-    elseif hotswap_state == "staged" then
-      -- Cancel: restore old beat_bits and cancel staging
-      looper:cancel_staging()
-      if hotswap_saved_beat_bits then
-        for i = 1, 5 do beat_bits[i] = hotswap_saved_beat_bits[i] end
-        hotswap_saved_beat_bits = nil
-      end
-      hotswap_staged = nil
-      hotswap_state = "idle"
-      looper:request_waveform()
-    end
-    grid_dirty = true
-    is_screen_dirty = true
-    return
-  end
-
-  -- ── Row 3, col 16: Record arm ──
-  if row == 3 and col == 16 and z == 1 then
-    if rec_state == "idle" then
-      rec_state = "armed"
-    elseif rec_state == "armed" then
-      rec_state = "idle"
-    elseif rec_state == "recording" then
-      stop_recording()
-    end
-    grid_dirty = true
-    is_screen_dirty = true
-    return
-  end
-
-  -- ── Rows 4-8, cols 1-16: Sample pads + snapshots ──
-  local idx = grid_to_sample(col, row)
-  print(string.format("grid_key: col=%d row=%d z=%d idx=%s", col, row, z, tostring(idx)))
-  if idx then
-    if z == 1 then
-      if hotswap_state == "armed" then
-        -- Stage this sample for hot swap
-        local s = samples[idx]
-        local duration = get_file_duration(s.filepath)
-        if duration and duration > 0 then
-          local bpm, beats = calculate_bpm(duration)
-          -- Save current beat_bits for cancel
-          hotswap_saved_beat_bits = {}
-          for i = 1, 5 do hotswap_saved_beat_bits[i] = beat_bits[i] end
-          -- Update beat_bits to preview new state
-          set_beat_bits(beats)
-          -- Stage file (waveform preview only, audio unchanged)
-          looper:stage_file(s.filepath, duration)
-          looper:request_waveform()
-          hotswap_staged = {
-            idx = idx,
-            filepath = s.filepath,
-            duration = duration,
-            bpm = bpm,
-            beats = beats,
-          }
-          hotswap_state = "staged"
-          current_playing_pad = idx
-          grid_dirty = true
-          is_screen_dirty = true
-        end
-        return
-      elseif hotswap_state == "staged" then
-        -- Commit hot swap then trigger normally
-        commit_hotswap()
-      end
-      trigger_sample(idx)
-    end
-  elseif row >= 1 and row <= 8 and col >= 1 and col <= 16 and z == 1 then
-    -- Empty pad: snapshot save/load
-    print(string.format("snapshot: col=%d row=%d has_existing=%s",
-      col, row, tostring(grid_snapshots[row] and grid_snapshots[row][col] or false)))
-    if grid_snapshots[row] and grid_snapshots[row][col] then
-      load_snapshot(col, row)
+      gap = 0
     else
-      save_snapshot(col, row)
-    end
-  end
-end
-
--- ─── Grid LED Redraw ───
-function grid_redraw()
-  if not grid_dirty then return end
-  grid_dirty = false
-
-  g:all(LED_OFF)
-  local now = util.time()
-  local is_beat_flash = (now - beat_flash_time) < 0.08
-  local is_shuffle2_flash = (now - shuffle2_flash_time) < 0.12
-  local is_shuffle4_flash = (now - shuffle4_flash_time) < 0.12
-  local is_snap_pow2_flash = (now - snap_pow2_flash_time) < 0.12
-  local is_clear_flash = (now - clear_flash_time) < 0.12
-  local is_snapshot_flash = (now - snapshot_flash_time) < 0.15
-
-  -- Row 1, cols 1-5: Binary beat length bits
-  for col = 1, 5 do
-    g:led(col, 1, beat_bits[col] and LED_BRIGHT or LED_OFF)
-  end
-
-  -- Row 1, col 6: Preserve snap to 0% (momentary)
-  g:led(6, 1, preserve0_held and LED_MAX or LED_DIM)
-  -- Row 1, col 7: Solo mode
-  g:led(7, 1, solo_mode and LED_MAX or LED_DIM)
-  -- Row 1, col 8: Buffer mute
-  g:led(8, 1, buffer_muted and LED_MAX or LED_DIM)
-  -- Row 1, col 9: Clear all (extra dim — destructive action)
-  g:led(9, 1, is_clear_flash and LED_MAX or 1)
-  -- Row 1, col 10: Snap to power-of-2 beats
-  g:led(10, 1, is_snap_pow2_flash and LED_MAX or LED_DIM)
-  -- Row 1, col 11: Tap tempo (blinks on beat)
-  g:led(11, 1, is_beat_flash and LED_MAX or LED_DIM)
-  -- Row 1, col 12: Shuffle 1/2 beat
-  g:led(12, 1, is_shuffle2_flash and LED_MAX or LED_MED)
-  -- Row 1, col 13: Shuffle 1/4 beat
-  g:led(13, 1, is_shuffle4_flash and LED_MAX or LED_MED)
-  -- Row 1, cols 14-16: Isolator kills
-  for col = 14, 16 do
-    g:led(col, 1, iso_kills[col - 13] and LED_MAX or LED_DIM)
-  end
-
-  -- Row 2: Waveform amplitude display + playhead ticker
-  local playhead_col = 0
-  if looper.buffer_dur > 0 then
-    playhead_col = math.floor(looper.playhead_pos / looper.buffer_dur * 16) + 1
-    if playhead_col > 16 then playhead_col = 16 end
-  end
-  for col = 1, 16 do
-    if col == playhead_col then
-      g:led(col, 2, LED_MAX)
-    else
-      g:led(col, 2, waveform_brightness[col] or 0)
+      gap = gap + 1
     end
   end
 
-  -- Row 3: Pitch shift buttons (cols 1-10)
-  for col = 1, 10 do
-    g:led(col, 3, pitch_idle_brightness[col])
-  end
-
-  -- Row 3, col 15: Hot swap arm LED
-  if hotswap_state == "armed" then
-    local phase = now % 0.25
-    g:led(15, 3, phase < 0.125 and LED_MAX or LED_OFF)
-  elseif hotswap_state == "staged" then
-    g:led(15, 3, LED_BRIGHT)
-  else
-    g:led(15, 3, LED_DIM)
-  end
-
-  -- Row 3, col 16: Record arm LED
-  if rec_state == "armed" then
-    -- Blink at ~4Hz
-    local phase = now % 0.25
-    g:led(16, 3, phase < 0.125 and LED_MAX or LED_OFF)
-  elseif rec_state == "recording" then
-    g:led(16, 3, LED_MAX)
-  else
-    g:led(16, 3, LED_DIM)
-  end
-
-  -- Rate-limited waveform render request (~4 Hz)
-  local now_render = util.time()
-  if now_render - last_render_time >= RENDER_INTERVAL then
-    last_render_time = now_render
-    looper:request_waveform()
-  end
-
-  -- Rows 4-8: Sample pads (per-group brightness) + snapshots
-  for i = 1, num_samples do
-    local col, row = sample_to_grid(i)
-    local level
-    if current_playing_pad == i then
-      level = LED_MAX
-    else
-      level = group_brightness[samples[i].group_idx] or LED_DIM
-    end
-    g:led(col, row, level)
-  end
-
-  -- Snapshot pads: show saved snapshots on empty grid positions
-  for row = 1, 8 do
-    if grid_snapshots[row] then
-      for col = 1, 16 do
-        if grid_snapshots[row][col] and not grid_to_sample(col, row) then
-          local level = LED_DIM
-          if is_snapshot_flash and snapshot_flash_pos
-            and snapshot_flash_pos.col == col and snapshot_flash_pos.row == row then
-            level = LED_MAX
-          end
-          g:led(col, row, level)
-        end
+  -- Scan backward (past): from cur-1 to cur - half
+  last_name = nil
+  gap = 0
+  -- We collect in reverse order, then the list ends up nearest-first
+  for off = 1, half do
+    local sub = (cur - off) % total
+    local name = track.name_data[sub]
+    if name then
+      if name ~= last_name or gap > GAP_TOLERANCE then
+        table.insert(past, {name = name, offset = -off})
+        last_name = name
       end
+      gap = 0
+    else
+      gap = gap + 1
     end
   end
 
-  g:refresh()
-
-  -- Keep redrawing while playing (playhead ticker needs continuous updates)
-  if looper:get_playing() == 1 then
-    grid_dirty = true
-  elseif rec_state == "armed" or hotswap_state == "armed"
-    or is_beat_flash or is_shuffle2_flash or is_shuffle4_flash
-    or is_snap_pow2_flash or is_clear_flash
-    or is_snapshot_flash then
-    grid_dirty = true
-  end
+  return {past = past, future = future}
 end
 
--- ─── Screen Redraw ───
 function redraw()
   screen.clear()
+  screen.font_size(8)
 
-  local left_x = 2
-  local right_x = 126
-  local y = 10
-
-  -- Header
+  -- Header row
+  local tempo = params:get("clock_tempo")
   screen.level(15)
-  screen.move(left_x, y)
-  screen.text("ERASUMS")
-  local tempo = hotswap_staged and hotswap_staged.bpm or params:get("clock_tempo")
-  screen.move(right_x, y)
-  if hotswap_staged then
-    screen.text_right(math.floor(tempo + 0.5) .. "bpm >>")
-  elseif active_pitch_shift ~= 0 then
-    local eff = looper:get_effective_tempo()
-    screen.text_right(math.floor(eff + 0.5) .. "bpm (" .. math.floor(tempo + 0.5) .. ")")
-  else
-    screen.text_right(math.floor(tempo + 0.5) .. "bpm")
+  screen.move(1, HEADER_H)
+  screen.text(math.floor(tempo + 0.5) .. "bpm")
+
+  -- Rec state on right
+  screen.move(126, HEADER_H)
+  if state.rec_state == "armed" then
+    screen.text_right("ARM")
+  elseif state.rec_state == "recording" then
+    screen.text_right("REC")
   end
 
-  -- Loop info
-  y = y + 12
-  screen.level(12)
-  screen.move(left_x, y)
-  local nb = hotswap_staged and hotswap_staged.beats or looper:get_num_beats()
-  local bits_str = ""
-  for i = 1, 5 do bits_str = bits_str .. (beat_bits[i] and "1" or "0") end
-  screen.text("loop: " .. nb .. " beats [" .. bits_str .. "]")
-  screen.move(right_x, y)
-  if hotswap_staged then
-    screen.text_right(string.format("%.1fs >>", hotswap_staged.duration))
-  else
-    local dur = looper:get_loop_dur()
-    local rate = looper:get_effective_rate()
-    if math.abs(rate - 1.0) > 0.005 then
-      local semitones = 12 * math.log(rate) / math.log(2)
-      screen.text_right(string.format("%.1fs %+.0fst", dur, semitones))
-    else
-      screen.text_right(string.format("%.1fs", dur))
+  -- 3 columns
+  local subs_per_beat = Looper.ISO_SUBS_PER_BEAT
+  for ti = 1, 3 do
+    local t = state.tracks[ti]
+    local names = collect_names(t, subs_per_beat)
+    local x = COL_X[ti]
+    local bright = COL_BRIGHT[ti]
+    local dim = COL_DIM[ti]
+
+    -- Build display rows: past above center, future from center down
+    local rows = {}
+    for r = 1, NUM_ROWS do rows[r] = nil end
+
+    -- Center row = first future entry (current or next name)
+    if #names.future > 0 then
+      rows[CENTER_ROW] = names.future[1].name
+    end
+
+    -- Past rows: above center (row 3, 2, 1)
+    for p = 1, math.min(#names.past, CENTER_ROW - 1) do
+      rows[CENTER_ROW - p] = names.past[p].name
+    end
+
+    -- Future rows below center (row 5, 6, 7)
+    for f = 2, math.min(#names.future, NUM_ROWS - CENTER_ROW + 1) do
+      rows[CENTER_ROW + f - 1] = names.future[f].name
+    end
+
+    -- Draw rows
+    for r = 1, NUM_ROWS do
+      if rows[r] then
+        local y = HEADER_H + r * ROW_H
+        local display = rows[r]
+        if #display > NAME_MAX_CHARS then
+          display = display:sub(1, NAME_MAX_CHARS)
+        end
+        screen.level(r == CENTER_ROW and bright or dim)
+        screen.move(x, y)
+        screen.text(display)
+      end
     end
   end
-
-  -- Preserve
-  y = y + 12
-  screen.move(left_x, y)
-  if preserve0_held then
-    screen.text("preserve: 0% (held)")
-  else
-    screen.text("preserve: " .. math.floor(preserve_value * 100 + 0.5) .. "%")
-  end
-  screen.move(right_x, y)
-  if looper.rec_level > 0 then
-    if current_playing_pad then
-      local amp = pad_amps[current_playing_pad] or 2.0
-      screen.text_right(string.format("amp %.0f%%", amp * 100))
-    else
-      screen.text_right("rec ON")
-    end
-  else
-    screen.text_right("rec OFF")
-  end
-
-  -- Sample name / mode
-  y = y + 12
-  screen.move(left_x, y)
-  if current_playing_pad and samples[current_playing_pad] then
-    local name = samples[current_playing_pad].name
-    if hotswap_staged then
-      name = ">> " .. name
-    end
-    screen.text(truncate(name, 20))
-  end
-
-  -- Beat position bar
-  y = y + 12
-  screen.level(8)
-  local bar_w = 90
-  local bar_x = left_x
-  local beat = looper:get_cur_beat()
-  local fill_w = (nb > 0) and math.floor(bar_w * (beat + 1) / nb) or 0
-  screen.rect(bar_x, y - 5, fill_w, 5)
-  screen.fill()
-  screen.level(4)
-  screen.rect(bar_x, y - 5, bar_w, 5)
-  screen.stroke()
-  screen.level(12)
-  screen.move(right_x, y)
-  screen.text_right("beat " .. (beat + 1) .. "/" .. nb)
 
   screen.update()
 end
 
-function screen_frame_tick()
-  if is_screen_dirty then
-    is_screen_dirty = false
+local function screen_frame_tick()
+  -- Always redraw while any track is playing (names scroll continuously)
+  local any_playing = false
+  for i = 1, 3 do
+    if state.tracks[i]:get_playing() == 1 then any_playing = true; break end
+  end
+  if any_playing or state.is_screen_dirty then
+    state.is_screen_dirty = false
     redraw()
   end
 end
@@ -1219,148 +925,205 @@ function enc(n, delta)
     -- Tempo
     params:delta("clock_tempo", delta)
   elseif n == 2 then
-    -- Preserve (continuous, 5% steps) — manual change cancels boost
-    preserve_value = util.clamp(preserve_value + delta * 0.05, 0, 1.0)
-    preserve_boosted = false
-    looper:set_pre_level(preserve_value)
-    grid_dirty = true
-    is_screen_dirty = true
+    -- Preserve (continuous, 5% steps)
+    local tgts = state.target_tracks()
+    for _, ti in ipairs(tgts) do
+      state.track_preserve[ti] = util.clamp(state.track_preserve[ti] + delta * 0.05, 0, 1.0)
+      state.track_preserve_boosted[ti] = false
+      state.tracks[ti]:set_pre_level(state.track_preserve[ti])
+    end
+    state.grid_dirty = true
+    state.is_screen_dirty = true
   elseif n == 3 then
-    -- Per-pad amp boost (adjusts last played pad, saved in presets)
-    if current_playing_pad then
-      local cur = params:get("sample_" .. current_playing_pad .. "_amp")
-      params:set("sample_" .. current_playing_pad .. "_amp", cur + delta * 0.25)
+    -- Per-pad amp boost
+    if state.current_playing_pad then
+      local cur = params:get("sample_" .. state.current_playing_pad .. "_amp")
+      params:set("sample_" .. state.current_playing_pad .. "_amp", cur + delta * 0.25)
     end
   end
 end
 
 function key(n, z)
   if n == 2 and z == 1 then
-    -- Play/pause looper
-    if looper:get_playing() == 1 then
-      looper:set_playing(0)
-    else
-      looper:set_playing(1)
+    -- Play/pause all loopers
+    local new_state = state.tracks[1]:get_playing() == 1 and 0 or 1
+    for i = 1, 3 do
+      state.tracks[i]:set_playing(new_state)
     end
-    grid_dirty = true
-    is_screen_dirty = true
+    state.grid_dirty = true
+    state.is_screen_dirty = true
   elseif n == 3 and z == 1 then
-    -- Toggle recording
-    if looper.rec_level > 0 then
-      looper:set_rec_level(0)
-    else
-      looper:set_rec_level(1.0)
+    -- Record arm state machine
+    if state.rec_state == "idle" then
+      state.rec_state = "armed"
+    elseif state.rec_state == "armed" then
+      state.rec_state = "idle"
+    elseif state.rec_state == "recording" then
+      stop_recording()
     end
-    is_screen_dirty = true
+    state.is_screen_dirty = true
   end
 end
 
 -- ─── Clock callbacks ───
 function clock.transport.start()
-  looper:set_playing(1)
-  grid_dirty = true
-  is_screen_dirty = true
+  for i = 1, 3 do
+    state.tracks[i]:set_playing(1)
+  end
+  state.grid_dirty = true
+  state.is_screen_dirty = true
 end
 
 function clock.transport.stop()
-  looper:set_playing(0)
-  grid_dirty = true
-  is_screen_dirty = true
+  for i = 1, 3 do
+    state.tracks[i]:set_playing(0)
+  end
+  state.grid_dirty = true
+  state.is_screen_dirty = true
 end
 
 -- ─── Init ───
 function init()
-  -- 0. Ensure snapshot directory exists
-  ensure_snapshot_dir()
+  -- 1. Create 3 Looper instances
+  state.tracks[1] = Looper.new(1, 1, 2, 0)
+  state.tracks[2] = Looper.new(2, 3, 4, 100)
+  state.tracks[3] = Looper.new(3, 5, 6, 200)
 
-  -- 1. Create looper object (no softcut setup yet)
-  looper = Looper.new()
-
-  -- 2. Scan sample folder and register params
+  -- 2. Scan snapshots first (so sample flood-fill avoids their slots), then samples
+  scan_snapshots()
   scan_samples()
   add_sample_params()
 
-  -- 3. Set up tempo param action
+  -- 3. Set up tempo param action (shared across all tracks)
   local default_tempo_action = params:lookup_param("clock_tempo").action
   params:set_action("clock_tempo", function(value)
     if default_tempo_action then default_tempo_action(value) end
-    looper:set_tempo(value)
-    is_screen_dirty = true
+    for i = 1, 3 do
+      state.tracks[i]:set_tempo(value)
+    end
+    state.is_screen_dirty = true
   end)
 
-  -- 4. Restore saved preset (triggers param actions to sync pad_amps + tempo)
+  -- 4. Restore saved preset
   params:default()
 
-  -- 5. Initialize looper AFTER params:default() so audio routing sticks
-  --    (params:default resets cut_input_eng etc. to system defaults)
-  looper:init()
-  looper:set_pre_level(preserve_value)
+  -- 5. Initialize softcut -- reset once, then init all 3 loopers
+  softcut.reset()
 
-  -- Waveform render callback: copy brightness data and mark grid dirty
-  looper.on_waveform_callback = function()
-    for i = 1, 16 do
-      waveform_brightness[i] = looper.waveform_brightness[i] or 0
-    end
-    grid_dirty = true
+  -- Audio routing (transient only — never use params:set for system audio)
+  audio.level_eng(ENG_LEVEL)
+  refresh_global_eng_cut()
+  audio.level_adc_cut(0)
+  audio.level_tape_cut(0)
+  audio.level_cut(1)
+
+  softcut.buffer_clear()
+
+  for i = 1, 3 do
+    state.tracks[i]:init()
+    state.tracks[i]:set_pre_level(state.track_preserve[i])
   end
 
-  -- Initial waveform render request
-  looper:request_waveform()
+  -- Input routing: only recording_target track receives engine input
+  state.refresh_input_routing()
 
-  -- Beat callback for grid flash + preserve boost release + routing enforcement
-  looper.on_beat_callback = function(beat)
-    beat_flash_time = util.time()
-    -- Safety net: detect and re-enforce engine→softcut routing drift
-    if not looper.capturing and not solo_mode then
-      local cut_eng = params:get("cut_input_eng")
-      if cut_eng < -10 then
-        print("WARNING: eng→cut routing drift detected (" ..
-          string.format("%.1f", cut_eng) .. " dB), re-enforcing")
+  -- Phase polling dispatch: route L voice of each track to its instance
+  local voice_to_track = {[1]=1, [3]=2, [5]=3}
+  softcut.event_phase(function(voice, pos)
+    local ti = voice_to_track[voice]
+    if ti then state.tracks[ti]:on_phase(pos) end
+  end)
+  for i = 1, 3 do
+    softcut.phase_quant(state.tracks[i].voice_l, 1/30)
+  end
+  softcut.poll_start_phase()
+
+  -- Beat callback: uses track 1 for shared beat clock
+  state.tracks[1].on_beat_callback = function(beat)
+    -- Reset counter
+    if state.reset_counter_beats > 0 then
+      state.global_beat_count = state.global_beat_count + 1
+      if state.global_beat_count % state.reset_counter_beats == 0 then
+        for i = 1, 3 do state.tracks[i]:jump_to_mark() end
       end
     end
-    looper:_refresh_eng_cut()
-    -- On loop wrap: release preserve boost if no triggers this pass
-    if beat == 0 and preserve_boosted then
-      if not trigger_this_loop then
-        preserve_boosted = false
-        if not preserve0_held and not buffer_muted then
-          looper:set_pre_level(preserve_value)
+
+    -- Per-track boost release on loop wrap
+    for i = 1, 3 do
+      if beat == 0 and state.track_preserve_boosted[i] then
+        if not state.track_trigger_this_loop[i] then
+          state.track_preserve_boosted[i] = false
+          if not state.track_preserve0_held[i] then
+            state.tracks[i]:set_pre_level(state.track_preserve[i])
+          end
         end
+        state.track_trigger_this_loop[i] = false
+        state.track_writing_name[i] = nil
       end
-      trigger_this_loop = false
     end
-    grid_dirty = true
-    is_screen_dirty = true
+
+    -- Re-enforce engine->softcut routing
+    refresh_global_eng_cut()
+    state.refresh_input_routing()
+
+    state.grid_dirty = true
+    state.is_screen_dirty = true
   end
 
-  -- Iso subdivision callback: fired when the playhead reaches a stored
-  -- change event. Applies the filter state (sample-and-hold between events).
-  -- When preserve0 is held, erases events as the playhead passes.
-  looper.on_iso_tick = function(sub, kills)
-    if preserve0_held then
-      looper:clear_iso_data_at(sub)
-      return
+  -- Per-track iso tick callbacks
+  for i = 1, 3 do
+    local track_idx = i
+    state.tracks[i].on_iso_tick = function(sub, kills)
+      if state.track_preserve0_held[track_idx] then
+        state.tracks[track_idx]:clear_iso_data_at(sub)
+        return
+      end
+      -- Guard: if recording disabled, don't save iso and clear stored data
+      if not state.track_recording_enabled[track_idx] then
+        state.tracks[track_idx]:clear_iso_data_at(sub)
+        return
+      end
+      local k = state.track_iso_kills[track_idx]
+      if kills[1] ~= k[1] or kills[2] ~= k[2] or kills[3] ~= k[3] then
+        state.track_iso_kills[track_idx] = {kills[1], kills[2], kills[3]}
+        state.tracks[track_idx]:update_iso(kills[1], kills[2], kills[3])
+        state.refresh_input_routing()
+        state.grid_dirty = true
+      end
     end
-    if kills[1] ~= iso_kills[1] or kills[2] ~= iso_kills[2] or kills[3] ~= iso_kills[3] then
-      iso_kills = {kills[1], kills[2], kills[3]}
-      looper:update_iso(kills[1], kills[2], kills[3])
-      print(string.format("iso: playback at sub %d → {%s,%s,%s}",
-        sub, tostring(kills[1]), tostring(kills[2]), tostring(kills[3])))
-      grid_dirty = true
+  end
+
+  -- Per-track name_data sub tick callbacks
+  -- Unlike iso_data (a control layer), name_data describes what audio is in the
+  -- buffer. Only erase names when audio is actually being erased (preserve0 held),
+  -- and only write names when new audio is actively being recorded.
+  for i = 1, 3 do
+    local track_idx = i
+    state.tracks[i].on_sub_tick = function(sub)
+      if state.track_preserve0_held[track_idx] then
+        -- Audio is being erased at this position
+        state.tracks[track_idx]:clear_name_data_at(sub)
+        return
+      end
+      if state.track_writing_name[track_idx] and state.track_recording_enabled[track_idx] then
+        state.tracks[track_idx]:set_name_at(sub, state.track_writing_name[track_idx])
+      end
     end
   end
 
   -- 6. Load samples into engine buffers
   load_samples()
 
-  -- 7. Start looper clock
-  looper:start_clock()
-  looper:start_iso_clock()
+  -- 7. Start clocks for all tracks
+  for i = 1, 3 do
+    state.tracks[i]:start_clock()
+    state.tracks[i]:start_iso_clock()
+  end
 
-  -- 8. Set initial beat length from binary bits
-  compute_num_beats()
+  -- 8. Initialize grid UI
+  GridUI.init(state)
 
-  -- 8. Start UI metros
+  -- 9. Start UI metros
   screen_refresh_metro = metro.init()
   if screen_refresh_metro then
     screen_refresh_metro.event = screen_frame_tick
@@ -1369,28 +1132,29 @@ function init()
 
   grid_refresh_metro = metro.init()
   if grid_refresh_metro then
-    grid_refresh_metro.event = grid_redraw
+    grid_refresh_metro.event = GridUI.redraw
     grid_refresh_metro:start(1 / GRID_FRAMERATE)
   end
 
-  -- 9. Connect grid
-  g.key = grid_key
+  -- 10. Connect grid
+  state.g.key = GridUI.key
   grid.add = function(dev)
-    g = grid.connect()
-    g.key = grid_key
-    grid_dirty = true
+    state.g = grid.connect()
+    state.g.key = GridUI.key
+    state.grid_dirty = true
   end
 
-  is_screen_dirty = true
-  grid_dirty = true
+  state.is_screen_dirty = true
+  state.grid_dirty = true
+
 end
 
 -- ─── Cleanup ───
 function cleanup()
   params:write()
 
-  -- Stop all voices and free buffers
-  for i = 1, num_samples do
+  -- Stop all engine voices
+  for i = 1, state.num_samples do
     engine.mxsamplesoff(i)
   end
   engine.mxsamplesrelease()
@@ -1405,8 +1169,12 @@ function cleanup()
     grid_refresh_metro = nil
   end
 
-  -- Cleanup looper (restores audio levels, cancels clock)
-  if looper then
-    looper:cleanup()
+  -- Cleanup all 3 loopers
+  for i = 1, 3 do
+    if state.tracks[i] then
+      state.tracks[i]:cleanup()
+    end
   end
+
+  -- No system audio restore needed — we only use transient audio.* calls
 end
