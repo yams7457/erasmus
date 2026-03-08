@@ -24,7 +24,7 @@ local ISO_SUBS_PER_BEAT = 32     -- 128th note resolution for iso data buffer
 -- Engine attenuation: instead of boosting softcut output (which bakes into
 -- tape bounces), we attenuate the engine on both paths (monitoring + recording)
 -- so that softcut playback at unity matches the engine. Tape-stable.
-local ENG_LEVEL = 1 / 1.4
+local ENG_LEVEL = 1.0
 
 -- Constructor: each Looper instance owns a pair of softcut voices in a buffer region.
 -- track_id: 1, 2, or 3
@@ -42,10 +42,10 @@ function Looper.new(track_id, voice_l, voice_r, buffer_offset)
   self.rec_level = 1.0
   self.pre_level = 1.0
   self.base = 2                  -- beat base: cycles 2→3→5
-  self.multiplier = 4            -- num_beats = base * multiplier
-  self.num_beats = 8             -- base * multiplier (default 2*4=8)
+  self.multiplier = 1            -- num_beats = base * multiplier (or 1 at init)
+  self.num_beats = 1             -- minimum loop length at startup
   self.tempo = 120
-  self.loop_dur = (8 / 120) * 60 -- default
+  self.loop_dur = (1 / 120) * 60 -- default
   self.loop_start_pos = 0        -- relative to buffer_offset
   self.loop_end_pos = 0          -- absolute buffer position of loop end (set in init)
   self.playhead_pos = 0          -- relative position tracked via phase polling
@@ -119,8 +119,7 @@ function Looper:init()
     softcut.pre_filter_rq(voice, 2.0)
   end
 
-  -- Set initial loop_end
-  self.num_beats = self.base * self.multiplier
+  -- Set initial loop_end (num_beats set in constructor)
   self.loop_dur = (self.num_beats / self.tempo) * 60
   self.buffer_dur = self.loop_dur
   self.rate = 1.0
@@ -443,8 +442,9 @@ end
 -- On release: both filters return to passthrough; buffer retains printed
 -- changes; engine→softcut recording resumes.
 -- Softcut's SVF is 12dB/oct, so cutoffs are pushed aggressively.
-local ISO_FADE_SECS = 0.010  -- 10ms cutoff frequency sweep
-local ISO_FADE_STEPS = 3
+
+local ISO_FADE_SECS = 0.005  -- 5ms cutoff frequency sweep
+local ISO_FADE_STEPS = 5
 
 function Looper:update_iso(kill_low, kill_mid, kill_high)
   -- Cancel any in-progress fc sweep
@@ -454,6 +454,8 @@ function Looper:update_iso(kill_low, kill_mid, kill_high)
   end
 
   local n_kills = (kill_low and 1 or 0) + (kill_mid and 1 or 0) + (kill_high and 1 or 0)
+  print(string.format("iso[%d]: low=%s mid=%s high=%s n=%d",
+    self.track_id, tostring(kill_low), tostring(kill_mid), tostring(kill_high), n_kills))
   local dry, lp, hp, bp, br, fc, rq = 0, 0, 0, 0, 0, 1000, 2.0
 
   if n_kills == 0 then
@@ -481,6 +483,9 @@ function Looper:update_iso(kill_low, kill_mid, kill_high)
     -- Kill mid+high → pass lows only → LP at 200 Hz
     lp = 1.0; fc = 200; rq = 1.4
   end
+
+  print(string.format("  → dry=%.1f lp=%.1f hp=%.1f bp=%.1f br=%.1f fc=%d rq=%.1f voices=%d,%d",
+    dry, lp, hp, bp, br, fc, rq, self.voices[1], self.voices[2]))
 
   -- Neutral fc: where this filter type is effectively transparent
   local neutral
@@ -633,6 +638,13 @@ end
 
 function Looper:set_name_at(sub, name)
   self.name_data[sub] = name
+end
+
+function Looper:fill_name_data(name)
+  local total = self:name_total_subs()
+  for sub = 0, total - 1 do
+    self.name_data[sub] = name
+  end
 end
 
 function Looper:_resize_name_data(old_beats, new_beats)
@@ -822,7 +834,7 @@ end
 function Looper:stage_file(filepath, duration)
   self.staging = true
   self.staging_dur = duration
-  softcut.buffer_read_mono(filepath, 0, STAGING_OFFSET, duration, 1, 0)
+  softcut.buffer_read_mono(filepath, 0, STAGING_OFFSET, duration, 1, 1)
 end
 
 -- Commit staged file: re-read from disk into both softcut buffers at buffer_offset.
@@ -830,8 +842,8 @@ end
 function Looper:commit_staging(filepath, duration)
   self.staging = false
   self.staging_dur = 0
-  softcut.buffer_read_mono(filepath, 0, self.buffer_offset, duration, 1, 0)
-  softcut.buffer_read_mono(filepath, 0, self.buffer_offset, duration, 2, 0)
+  softcut.buffer_read_mono(filepath, 0, self.buffer_offset, duration, 1, 1)
+  softcut.buffer_read_mono(filepath, 0, self.buffer_offset, duration, 1, 2)
 end
 
 -- Cancel staging: clear flag, no buffer changes needed (staging area is ignored).
@@ -849,25 +861,22 @@ function Looper:jump_to_position(fraction)
   self.cur_beat = math.floor(fraction * self.num_beats)
 end
 
--- Begin direct-to-buffer recording. Softcut already receives the engine
--- input in real-time — we just clear the buffer region, park the playhead at
--- buffer_offset, open up a long recording region, and zero pre_level so old
--- content doesn't bleed through. The capturing flag guards routing and resize.
+-- Begin tape-based recording. Captures the full DAC output (engine + softcut
+-- playback = exactly what the performer hears) to a temp WAV file. This is
+-- faithful even when cue points jump the playhead around, because the tape
+-- records the mix output, not the buffer write head.
 function Looper:start_recording()
   self.capturing = true
   self.capture_start_time = util.time()
-  -- Clear this track's region and set up linear recording space
-  softcut.buffer_clear_region(self.buffer_offset, self.region_size)
-  for _, voice in ipairs(self.voices) do
-    softcut.loop_end(voice, self.buffer_offset + self.region_size)
-    softcut.position(voice, self.buffer_offset)
-    softcut.pre_level(voice, 0)
-  end
+  local tmp = _path.audio .. "erasmus/capture_tmp.wav"
+  audio.tape_record_open(tmp)
+  audio.tape_record_start()
 end
 
--- End direct-to-buffer recording. Returns recorded duration.
+-- End tape recording. Returns wallclock duration.
 function Looper:stop_recording()
   self.capturing = false
+  audio.tape_record_stop()
   local duration = math.min(util.time() - self.capture_start_time, self.region_size)
   duration = math.max(duration, 0.5)
   return duration

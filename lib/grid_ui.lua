@@ -5,21 +5,25 @@
 -- Grid 256 layout:
 --   Row 1, cols 1-16 (toolbar):
 --     Menus:     Col 1: Track Select  Col 2: Length  Col 3: Pitch  Col 4: Isolator  Col 5: Shuffle
---     Reverse:   Col 6: Reverse
---     Transport: Col 7: Play/Pause (global)  Col 8: Tap Tempo (global)
---     Creative:  Col 9: Cue Point
---     Record:    Col 10: Toggle Record
---     Clear:     Col 11: Momentary Clear  Col 12: Full Clear
---     Output:    Col 13: Track Mute
---     Gap:       Cols 14-15: dark
+--     Gap:       Col 6: dark
+--     Actions:   Col 7: Momentary Clear  Col 8: Toggle Record  Col 9: Full Clear  Col 10: Track Mute
+--     Tempo:     Col 11: Tap Tempo
+--     Gap:       Col 12: dark
+--     Audio In:  Col 13: ADC Monitor  Col 14: ADC Record (includes monitor)
+--     Record:    Col 15: Rec Arm
 --     Save:      Col 16: Save Snapshot
---   Row 2: Menu area (horizontal options) or loop position tracker (when no menu open)
+--   Row 2: Menu area (horizontal options), or loop position tracker + jump-to-position (when no menu open)
 --   Rows 3-16: Sample pads + cue points + scene snapshots (14 rows x 16 cols = 224 slots)
+--   Empty sample pad tap: creates cue point at current playhead position
 
 local GridUI = {}
 
--- Module-level reference to shared state (set by init)
+-- Module-level references (set by init)
 local S
+local Snapshots
+local Samples
+local Recording
+local AudioIO
 
 -- LED brightness constants
 local LED_OFF = 0
@@ -86,7 +90,7 @@ end
 local MENU_COLS = {
   [1] = {count = 4},   -- Track Select
   [2] = {count = 6},   -- Length
-  [3] = {count = 10},  -- Pitch
+  [3] = {count = 12},  -- Pitch (10 intervals + gap + reverse)
   [4] = {count = 4},   -- Iso (3 bands + clear)
   [5] = {count = 7},   -- Beat Shuffle
 }
@@ -95,6 +99,24 @@ local MENU_COLS = {
 local TAP_TIMEOUT = 2.0
 
 -- ─── Toolbar Actions ───
+
+local function do_tap_tempo()
+  local now = util.time()
+  if #S.tap_times > 0 and (now - S.tap_times[#S.tap_times]) > TAP_TIMEOUT then
+    S.tap_times = {}
+  end
+  table.insert(S.tap_times, now)
+  while #S.tap_times > S.tap_tempo_max do
+    table.remove(S.tap_times, 1)
+  end
+  if #S.tap_times >= 2 then
+    local total = S.tap_times[#S.tap_times] - S.tap_times[1]
+    local avg_interval = total / (#S.tap_times - 1)
+    if avg_interval > 0 then
+      params:set("clock_tempo", 60 / avg_interval)
+    end
+  end
+end
 
 local function do_momentary_clear(z)
   local tgts = S.target_tracks()
@@ -154,9 +176,10 @@ local function do_full_clear()
   S.refresh_input_routing()
 end
 
-local function do_cue_point()
-  -- No-op when global is selected
+local function do_cue_point_at(row, col)
+  -- No-op when global is selected or slot is occupied
   if S.selected_track == 4 then return end
+  if S.is_slot_occupied(row, col) then return end
 
   local track_idx = S.selected_track
   local t = S.tracks[track_idx]
@@ -170,11 +193,7 @@ local function do_cue_point()
   -- Set mark_pos for reset counter compatibility
   t:set_mark(fraction)
 
-  -- Find free slot (prefers prime-numbered positions for distribution)
-  local row, col = S.find_free_cue_slot()
-  if not row then return end  -- plane full
-
-  -- Add cue point
+  -- Add cue point at the pressed pad's position
   local cue = {track_idx = track_idx, fraction = fraction, grid_row = row, grid_col = col}
   table.insert(S.cue_points, cue)
   if not S.grid_cue_points[row] then S.grid_cue_points[row] = {} end
@@ -188,37 +207,10 @@ local function do_toggle_record()
     if S.track_recording_enabled[i] then
       S.tracks[i]:set_rec_level(1.0)
     else
-      S.tracks[i]:set_rec_level(0)
-    end
-  end
-end
-
-local function do_play_pause()
-  -- Global: toggle all 3 tracks
-  local new_state = S.tracks[1]:get_playing() == 1 and 0 or 1
-  for i = 1, 3 do
-    S.tracks[i]:set_playing(new_state)
-  end
-end
-
-local function do_tap_tempo()
-  local now = util.time()
-  -- Reset if too long since last tap
-  if #S.tap_times > 0 and (now - S.tap_times[#S.tap_times]) > TAP_TIMEOUT then
-    S.tap_times = {}
-  end
-  table.insert(S.tap_times, now)
-  -- Keep only the most recent taps
-  while #S.tap_times > S.tap_tempo_max do
-    table.remove(S.tap_times, 1)
-  end
-  -- Need at least 2 taps to compute tempo
-  if #S.tap_times >= 2 then
-    local total = S.tap_times[#S.tap_times] - S.tap_times[1]
-    local avg_interval = total / (#S.tap_times - 1)
-    if avg_interval > 0 then
-      local bpm = 60 / avg_interval
-      params:set("clock_tempo", bpm)
+      -- Don't zero rec_level if ADC recording is active for this track
+      if S.adc_to_softcut == 0 or i ~= S.recording_target then
+        S.tracks[i]:set_rec_level(0)
+      end
     end
   end
 end
@@ -272,43 +264,62 @@ local function do_track_mute()
 end
 
 local function do_save_snapshot()
-  S.save_snapshot()
+  Snapshots.save()
 end
 
 -- ─── Grid Key Handlers ───
 
 local function handle_toolbar(col, z)
   -- Non-menu items: execute immediately, do NOT affect active_menu
-  if col == 6 and z == 1 then
-    do_reverse()
-    return
-  end
-  if col == 7 and z == 1 then
-    do_play_pause()
-    return
-  end
-  if col == 8 and z == 1 then
-    do_tap_tempo()
-    return
-  end
-  if col == 9 and z == 1 then
-    do_cue_point()
-    return
-  end
-  if col == 10 and z == 1 then
-    do_toggle_record()
-    return
-  end
-  if col == 11 then
+  if col == 7 then
     do_momentary_clear(z)
     return
   end
-  if col == 12 and z == 1 then
+  if col == 8 and z == 1 then
+    do_toggle_record()
+    return
+  end
+  if col == 9 and z == 1 then
     do_full_clear()
     return
   end
-  if col == 13 and z == 1 then
+  if col == 10 and z == 1 then
     do_track_mute()
+    return
+  end
+  if col == 11 and z == 1 then
+    do_tap_tempo()
+    return
+  end
+  if col == 13 and z == 1 then
+    -- Toggle ADC monitor (hear external input)
+    if S.adc_monitor > 0 then
+      AudioIO.set_monitor(0)
+    else
+      AudioIO.set_monitor(1)
+    end
+    return
+  end
+  if col == 14 and z == 1 then
+    -- Toggle ADC record (external input → softcut buffer; includes monitor)
+    if S.adc_to_softcut > 0 then
+      AudioIO.set_adc_to_softcut(0)
+      AudioIO.set_monitor(0)
+      -- Restore rec_level based on col 8 state
+      local ti = S.recording_target
+      if not S.track_recording_enabled[ti] then
+        S.tracks[ti]:set_rec_level(0)
+      end
+    else
+      AudioIO.set_adc_to_softcut(1)
+      AudioIO.set_monitor(1)
+      -- Ensure rec_level is on so ADC actually writes to buffer
+      S.tracks[S.recording_target]:set_rec_level(1.0)
+    end
+    return
+  end
+  if col == 15 and z == 1 then
+    Recording.toggle()
     return
   end
   if col == 16 and z == 1 then
@@ -343,7 +354,20 @@ local function handle_toolbar(col, z)
 end
 
 local function handle_menu_press(col, row, z)
-  if z ~= 1 or S.active_menu == nil then return end
+  if z ~= 1 then return end
+
+  -- Any row 2 press starts recording if armed
+  Recording.begin_if_armed()
+
+  -- No menu open: row 2 press jumps to that fraction of the buffer
+  if S.active_menu == nil then
+    local fraction = (col - 1) / 16
+    local tgts = S.target_tracks()
+    for _, i in ipairs(tgts) do
+      S.tracks[i]:jump_to_position(fraction)
+    end
+    return
+  end
 
   -- Menus render horizontally on row 2, cols 1..N
   local menu = MENU_COLS[S.active_menu]
@@ -382,20 +406,25 @@ local function handle_menu_press(col, row, z)
     S.length_hold_made_selection = true
 
   elseif S.active_menu == 3 then
-    -- Pitch: cols 1-10 (absolute set; pressing current value resets to 0)
-    local pitch_idx = option_idx
-    local target = pitch_values[pitch_idx]
-    local tgts = S.target_tracks()
-    for _, i in ipairs(tgts) do
-      local new_val = S.tracks[i].pitch_shift_semitones == target and 0 or target
-      if new_val ~= S.tracks[i].pitch_shift_semitones then
-        S.tracks[i]:set_pitch_shift(new_val)
-        -- set_pitch_shift clears iso data; reset the kill state to match
-        S.track_iso_kills[i] = {false, false, false}
-        S.tracks[i]:update_iso(false, false, false)
+    if option_idx <= 10 then
+      -- Pitch: cols 1-10 (accumulate; each press adds the interval)
+      local delta = pitch_values[option_idx]
+      local tgts = S.target_tracks()
+      for _, i in ipairs(tgts) do
+        local new_val = S.tracks[i].pitch_shift_semitones + delta
+        if new_val ~= S.tracks[i].pitch_shift_semitones then
+          S.tracks[i]:set_pitch_shift(new_val)
+          -- set_pitch_shift clears iso data; reset the kill state to match
+          S.track_iso_kills[i] = {false, false, false}
+          S.tracks[i]:update_iso(false, false, false)
+        end
       end
+      S.refresh_input_routing()
+    elseif option_idx == 12 then
+      -- Reverse toggle
+      do_reverse()
     end
-    S.refresh_input_routing()
+    -- col 11 is a gap (no action)
 
   elseif S.active_menu == 4 then
     -- Iso: options 1-3 = band toggles, option 4 = clear iso data
@@ -415,7 +444,9 @@ local function handle_menu_press(col, row, z)
       S.track_iso_kills[i][band] = not S.track_iso_kills[i][band]
       local k = S.track_iso_kills[i]
       S.tracks[i]:update_iso(k[1], k[2], k[3])
-      S.tracks[i]:set_iso_at(S.tracks[i].iso_sub, k)
+      if S.track_recording_enabled[i] then
+        S.tracks[i]:set_iso_at(S.tracks[i].iso_sub, k)
+      end
     end
     S.refresh_input_routing()
 
@@ -429,21 +460,26 @@ local function handle_menu_press(col, row, z)
 end
 
 local function handle_sample_pad(col, row, z)
-  -- Release: stop sample playback
+  -- Release: stop sample/snapshot playback
   if z == 0 then
-    local idx = S.grid_to_sample(col, row)
-    if idx then S.stop_sample(idx) end
+    if S.current_playing_snapshot and S.grid_snapshots[row] and S.grid_snapshots[row][col] then
+      Snapshots.stop_playback()
+    else
+      local idx = S.grid_to_sample(col, row)
+      if idx then Samples.stop(idx) end
+    end
     return
   end
 
-  -- Check for cue point first
+  -- Check for cue point
   if S.grid_cue_points[row] and S.grid_cue_points[row][col] then
     local cue_idx = S.grid_cue_points[row][col]
     local cue = S.cue_points[cue_idx]
     if cue then
+      -- Cue points start recording when armed
+      Recording.begin_if_armed()
       local t = S.tracks[cue.track_idx]
       t:jump_to_position(cue.fraction)
-      -- Boost preserve on this track (same as old slice grid taps)
       S.track_trigger_this_loop[cue.track_idx] = true
       if not S.track_preserve_boosted[cue.track_idx] and not S.track_preserve0_held[cue.track_idx] then
         S.track_preserve_boosted[cue.track_idx] = true
@@ -453,17 +489,32 @@ local function handle_sample_pad(col, row, z)
     end
   end
 
-  -- Check for snapshot
+  -- Check for snapshot (mode depends on col 8 / track_recording_enabled)
   if S.grid_snapshots[row] and S.grid_snapshots[row][col] then
-    S.load_snapshot(row, col)
+    local snap_idx = S.grid_snapshots[row][col]
+    local any_rec_enabled = false
+    for i = 1, 3 do
+      if S.track_recording_enabled[i] then any_rec_enabled = true; break end
+    end
+    if any_rec_enabled then
+      Snapshots.load(row, col)
+    else
+      Snapshots.trigger_as_sample(snap_idx)
+    end
     return
   end
 
-  -- Fall back to sample trigger
+  -- Check for sample
   local idx = S.grid_to_sample(col, row)
   if idx then
-    S.trigger_sample(idx)
+    -- Samples start recording when armed
+    Recording.begin_if_armed()
+    Samples.trigger(idx)
+    return
   end
+
+  -- Empty pad: create cue point
+  do_cue_point_at(row, col)
 end
 
 function GridUI.key(col, row, z)
@@ -520,47 +571,15 @@ local function draw_toolbar(now)
     g:led(5, 1, LED_DIM)
   end
 
-  -- === Reverse (col 6) ===
+  -- === Col 6: dark gap ===
 
-  -- Col 6: Reverse
-  local any_reversed = S.track_reversed[1] or S.track_reversed[2] or S.track_reversed[3]
-  local all_reversed = S.track_reversed[1] and S.track_reversed[2] and S.track_reversed[3]
-  if all_reversed then
-    g:led(6, 1, LED_BRIGHT)
-  elseif any_reversed then
-    g:led(6, 1, LED_MED)
-  else
-    g:led(6, 1, LED_DIM)
-  end
+  -- === Actions (cols 7-10) ===
 
-  -- === Transport (cols 7-8) ===
+  -- Col 7: Momentary Clear
+  local any_held = S.track_preserve0_held[1] or S.track_preserve0_held[2] or S.track_preserve0_held[3]
+  g:led(7, 1, any_held and LED_MAX or LED_DIM)
 
-  -- Col 7: Play/Pause (global)
-  local any_playing = false
-  for i = 1, 3 do
-    if S.tracks[i]:get_playing() == 1 then any_playing = true; break end
-  end
-  g:led(7, 1, any_playing and LED_BRIGHT or LED_DIM)
-
-  -- Col 8: Tap Tempo (blink on beat using track 1 phase)
-  local tap_phase = 0
-  local t1 = S.tracks[1]
-  if t1.buffer_dur > 0 and t1.num_beats > 0 then
-    local beat_dur = t1.buffer_dur / t1.num_beats
-    if beat_dur > 0 then
-      tap_phase = (t1.playhead_pos / beat_dur) % 1.0
-    end
-  end
-  g:led(8, 1, tap_phase < 0.25 and LED_BRIGHT or LED_DIM)
-
-  -- === Creative (col 9) ===
-
-  -- Col 9: Cue Point
-  g:led(9, 1, LED_DIM)
-
-  -- === Record (col 10) ===
-
-  -- Col 10: Toggle Record
+  -- Col 8: Toggle Record
   local any_rec_disabled = false
   local all_rec_disabled = true
   for i = 1, 3 do
@@ -568,30 +587,22 @@ local function draw_toolbar(now)
     if S.track_recording_enabled[i] then all_rec_disabled = false end
   end
   if all_rec_disabled then
-    g:led(10, 1, LED_OFF)
+    g:led(8, 1, LED_OFF)
   elseif any_rec_disabled then
-    g:led(10, 1, LED_MED)
+    g:led(8, 1, LED_MED)
   else
-    g:led(10, 1, LED_BRIGHT)
+    g:led(8, 1, LED_BRIGHT)
   end
 
-  -- === Clear (cols 11-12) ===
-
-  -- Col 11: Momentary Clear
-  local any_held = S.track_preserve0_held[1] or S.track_preserve0_held[2] or S.track_preserve0_held[3]
-  g:led(11, 1, any_held and LED_MAX or LED_DIM)
-
-  -- Col 12: Full Clear
+  -- Col 9: Full Clear
   local any_clear_flash = false
   for i = 1, 3 do
     if (now - S.clear_flash_time[i]) < 0.12 then any_clear_flash = true; break end
   end
   if (now - S.global_clear_flash_time) < 0.12 then any_clear_flash = true end
-  g:led(12, 1, any_clear_flash and LED_MAX or 1)
+  g:led(9, 1, any_clear_flash and LED_MAX or 1)
 
-  -- === Output (col 13) ===
-
-  -- Col 13: Track Mute
+  -- Col 10: Track Mute
   local any_out_muted = false
   local all_out_muted = true
   for i = 1, 3 do
@@ -599,16 +610,51 @@ local function draw_toolbar(now)
     if not S.track_output_muted[i] then all_out_muted = false end
   end
   if all_out_muted then
-    g:led(13, 1, LED_OFF)
+    g:led(10, 1, LED_OFF)
   elseif any_out_muted then
-    g:led(13, 1, LED_MED)
+    g:led(10, 1, LED_MED)
   else
-    g:led(13, 1, LED_BRIGHT)
+    g:led(10, 1, LED_BRIGHT)
   end
 
-  -- === Save (col 16) ===
+  -- === Col 11: Tap Tempo (beat-synced blink) ===
+  local t1 = S.tracks[1]
+  local tempo_phase = 0
+  if t1.buffer_dur > 0 and t1.num_beats > 0 then
+    local beat_dur = t1.buffer_dur / t1.num_beats
+    if beat_dur > 0 then
+      tempo_phase = (t1.playhead_pos / beat_dur) % 1.0
+    end
+  end
+  g:led(11, 1, tempo_phase < 0.25 and LED_MAX or LED_DIM)
 
-  -- Col 16: Save Snapshot
+  -- === Col 12: dark gap ===
+
+  -- === Col 13: ADC Monitor ===
+  g:led(13, 1, S.adc_monitor > 0 and LED_BRIGHT or LED_OFF)
+
+  -- === Col 14: ADC Record (includes monitor) ===
+  g:led(14, 1, S.adc_to_softcut > 0 and LED_BRIGHT or LED_OFF)
+
+  -- === Col 15: Rec Arm ===
+  if S.rec_state == "recording" then
+    -- Blink on beat while recording
+    local t1 = S.tracks[1]
+    local tap_phase = 0
+    if t1.buffer_dur > 0 and t1.num_beats > 0 then
+      local beat_dur = t1.buffer_dur / t1.num_beats
+      if beat_dur > 0 then
+        tap_phase = (t1.playhead_pos / beat_dur) % 1.0
+      end
+    end
+    g:led(15, 1, tap_phase < 0.25 and LED_MAX or LED_MED)
+  elseif S.rec_state == "armed" then
+    g:led(15, 1, LED_BRIGHT)
+  else
+    g:led(15, 1, LED_DIM)
+  end
+
+  -- === Col 16: Save Snapshot ===
   local snap_flash = (now - S.snapshot_flash_time) < 0.15
   g:led(16, 1, snap_flash and LED_MAX or LED_DIM)
 end
@@ -651,6 +697,19 @@ local function draw_menu_area(now)
       else
         g:led(c, 2, pitch_idle_brightness[c])
       end
+    end
+    -- Col 11: gap (dark)
+    -- Col 12: Reverse toggle
+    local any_reversed = S.track_reversed[1] or S.track_reversed[2] or S.track_reversed[3]
+    local all_reversed = S.track_reversed[1] and S.track_reversed[2] and S.track_reversed[3]
+    if S.selected_track ~= 4 then
+      g:led(12, 2, S.track_reversed[S.selected_track] and LED_MAX or LED_DIM)
+    elseif all_reversed then
+      g:led(12, 2, LED_BRIGHT)
+    elseif any_reversed then
+      g:led(12, 2, LED_MED)
+    else
+      g:led(12, 2, LED_DIM)
     end
 
   elseif S.active_menu == 4 then
@@ -696,18 +755,18 @@ local function draw_cue_points(now)
   local g = S.g
   for _, cue in ipairs(S.cue_points) do
     local t = S.tracks[cue.track_idx]
-    -- Beat phase for blinking: derive from playhead position
-    local beat_phase = 0
+    -- Blink: 2-beat cycle derived from playhead position
+    local blink_phase = 0
     if t.buffer_dur > 0 and t.num_beats > 0 then
       local beat_dur = t.buffer_dur / t.num_beats
       if beat_dur > 0 then
-        beat_phase = (t.playhead_pos / beat_dur) % 1.0
+        blink_phase = (t.playhead_pos / (beat_dur * 2)) % 1.0
       end
     end
-    -- On for first half-beat, dim for second half
+    -- On for first half of 2-beat cycle, dim for second half
     local bright = CUE_BRIGHT[cue.track_idx]
     local dim_level = CUE_DIM[cue.track_idx]
-    local level = beat_phase < 0.5 and bright or dim_level
+    local level = blink_phase < 0.5 and bright or dim_level
     g:led(cue.grid_col, cue.grid_row, level)
   end
 end
@@ -716,9 +775,9 @@ local function draw_snapshots(now)
   local g = S.g
   local snap_flash = (now - S.snapshot_flash_time) < 0.15
 
-  -- Tempo-synced triangle wave glow
+  -- Tempo-synced triangle wave glow (slow pulsate: 4x slower than iso tick)
   local tempo = S.tracks[1].tempo or 120
-  local tick_dur = 60 / (tempo * ISO_SUBS_PER_BEAT)
+  local tick_dur = 60 / (tempo * ISO_SUBS_PER_BEAT) * 4
   local tick = math.floor(now / tick_dur)
   local range = LED_BRIGHT - LED_DIM  -- 9
   local phase = tick % (range * 2)
@@ -788,8 +847,12 @@ function GridUI.redraw()
   end
 end
 
-function GridUI.init(shared_state)
+function GridUI.init(shared_state, modules)
   S = shared_state
+  Snapshots = modules.snapshots
+  Samples = modules.samples
+  Recording = modules.recording
+  AudioIO = modules.audio_io
 end
 
 return GridUI
