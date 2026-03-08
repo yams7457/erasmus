@@ -21,7 +21,7 @@ local ScreenUI  = include("lib/screen_ui")
 local GridUI    = include("lib/grid_ui")
 local AudioIO   = include("lib/audio_io")
 
-engine.name = "MxSamples"
+engine.name = "MxSamplesErasmus"
 
 -- ─── Constants ───
 local SCREEN_FRAMERATE = 15
